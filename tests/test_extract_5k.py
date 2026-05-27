@@ -54,3 +54,66 @@ class TestExtractStratKeys:
         del d["info"]["essay_level"]
         with pytest.raises(KeyError, match="essay_level"):
             extract_strat_keys(d)
+
+
+class TestStratifiedSample:
+    def test_proportional_by_group_size(self):
+        # 100 items: 60 type A, 30 type B, 10 type C → target 10 ≈ 6/3/1
+        from pipelines.extract_5k import stratified_sample
+
+        items = (
+            [("A", i) for i in range(60)]
+            + [("B", i) for i in range(30)]
+            + [("C", i) for i in range(10)]
+        )
+        result = stratified_sample(items, key_fn=lambda x: x[0], target_n=10, seed=42)
+        from collections import Counter
+
+        c = Counter(k for k, _ in result)
+        assert c["A"] == 6
+        assert c["B"] == 3
+        assert c["C"] == 1
+        assert len(result) == 10
+
+    def test_deterministic_with_same_seed(self):
+        from pipelines.extract_5k import stratified_sample
+
+        items = [("X", i) for i in range(50)]
+        r1 = stratified_sample(items, key_fn=lambda x: x[0], target_n=10, seed=42)
+        r2 = stratified_sample(items, key_fn=lambda x: x[0], target_n=10, seed=42)
+        assert r1 == r2
+
+    def test_different_seed_gives_different_sample(self):
+        from pipelines.extract_5k import stratified_sample
+
+        items = [("X", i) for i in range(50)]
+        r1 = stratified_sample(items, key_fn=lambda x: x[0], target_n=10, seed=1)
+        r2 = stratified_sample(items, key_fn=lambda x: x[0], target_n=10, seed=2)
+        assert r1 != r2
+
+    def test_undersized_stratum_takes_all_available(self):
+        # 5 items in stratum, request would round to 10 → take all 5
+        from pipelines.extract_5k import stratified_sample
+
+        items = (
+            [("A", i) for i in range(95)]   # → 95 (90% of target 100)
+            + [("B", i) for i in range(5)]   # → 5 (capped at available)
+        )
+        result = stratified_sample(items, key_fn=lambda x: x[0], target_n=100, seed=42)
+        from collections import Counter
+
+        c = Counter(k for k, _ in result)
+        assert c["B"] == 5  # all available, not 10
+        assert c["A"] == 95
+        assert len(result) == 100
+
+    def test_target_n_zero_returns_empty(self):
+        from pipelines.extract_5k import stratified_sample
+
+        items = [("X", i) for i in range(50)]
+        assert stratified_sample(items, key_fn=lambda x: x[0], target_n=0, seed=42) == []
+
+    def test_empty_items_returns_empty(self):
+        from pipelines.extract_5k import stratified_sample
+
+        assert stratified_sample([], key_fn=lambda x: x[0], target_n=10, seed=42) == []
