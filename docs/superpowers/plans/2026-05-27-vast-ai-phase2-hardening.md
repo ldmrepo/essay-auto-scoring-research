@@ -682,6 +682,15 @@ class TestAuditDirectory:
         result = audit_directory(str(tmp_path))
         assert result["total_files"] == 0
         assert result["per_file"] == []
+
+    def test_cli_rejects_nonexistent_path(self, tmp_path, capsys):
+        from pipelines.audit_pii import _main
+
+        missing = tmp_path / "does_not_exist"
+        rc = _main([str(missing), "--report", str(tmp_path / "r.json"), "--fail-on-hit"])
+        assert rc == 2
+        err = capsys.readouterr().err
+        assert "does not exist or is not a directory" in err
 ```
 
 - [ ] **Step 2: 테스트 실행 → FAIL 확인**
@@ -742,6 +751,10 @@ def _main(argv: List[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
+    if not Path(args.root).is_dir():
+        sys.stderr.write(f"ERROR: root path does not exist or is not a directory: {args.root}\n")
+        return 2
+
     result = audit_directory(args.root)
     Path(args.report).write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -769,7 +782,7 @@ cd /home/dev/work/essay-auto-scoring-research && \
   python3 -m pytest tests/test_audit_pii.py -v 2>&1 | tail -20
 ```
 
-Expected: 14 passed.
+Expected: 15 passed.
 
 - [ ] **Step 5: 실제 sample 데이터에 audit 실행 → 0 hits 기대**
 

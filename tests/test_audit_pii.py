@@ -144,3 +144,12 @@ class TestAuditDirectory:
         result = audit_directory(str(tmp_path))
         assert result["total_files"] == 0
         assert result["per_file"] == []
+
+    def test_cli_rejects_nonexistent_path(self, tmp_path, capsys):
+        from pipelines.audit_pii import _main
+
+        missing = tmp_path / "does_not_exist"
+        rc = _main([str(missing), "--report", str(tmp_path / "r.json"), "--fail-on-hit"])
+        assert rc == 2
+        err = capsys.readouterr().err
+        assert "does not exist or is not a directory" in err

@@ -152,6 +152,10 @@ def _main(argv: List[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
+    if not Path(args.root).is_dir():
+        sys.stderr.write(f"ERROR: root path does not exist or is not a directory: {args.root}\n")
+        return 2
+
     result = audit_directory(args.root)
     Path(args.report).write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
 
