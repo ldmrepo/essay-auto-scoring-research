@@ -8,7 +8,9 @@ as group key, student_grade_group as stratify key) are preserved.
 from __future__ import annotations
 
 import hashlib
+import json
 import re
+from pathlib import Path
 from typing import List, TypedDict
 
 
@@ -75,3 +77,35 @@ def hash_essay_id(essay_id: str) -> str:
     """
     digest = hashlib.sha256(essay_id.encode("utf-8")).hexdigest()
     return digest[:16]
+
+
+def _collect_essay_texts(doc: dict) -> List[str]:
+    """Extract all free-form text fields a model could see (excludes prompts/scores)."""
+    texts: List[str] = []
+    if isinstance(doc.get("essay_txt"), str):
+        texts.append(doc["essay_txt"])
+    for p in doc.get("paragraph", []) or []:
+        if isinstance(p, dict) and isinstance(p.get("paragraph_txt"), str):
+            texts.append(p["paragraph_txt"])
+    return texts
+
+
+def audit_file(path: str) -> dict:
+    """Audit a single essay JSON. Returns report dict; does not modify the file."""
+    p = Path(path)
+    doc = json.loads(p.read_text(encoding="utf-8"))
+    if not isinstance(doc, dict):
+        raise ValueError(f"Expected JSON object, got {type(doc).__name__}: {path}")
+
+    hits: List[PiiHit] = []
+    for text in _collect_essay_texts(doc):
+        hits.extend(detect_pii(text))
+
+    essay_id = (doc.get("info") or {}).get("essay_id") or doc.get("essay_id") or ""
+    return {
+        "path": str(p),
+        "pii_count": len(hits),
+        "hits": hits,
+        "essay_id_original": essay_id,
+        "essay_id_hashed": hash_essay_id(essay_id) if essay_id else "",
+    }

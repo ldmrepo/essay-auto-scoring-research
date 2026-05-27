@@ -1,6 +1,7 @@
 """Tests for pipelines.audit_pii — PII detection + essay_id hashing for vast.ai upload."""
 
 import pytest
+from pathlib import Path
 
 from pipelines.audit_pii import detect_pii
 
@@ -69,3 +70,38 @@ class TestHashEssayId:
         ids = ["ESSAY_33474", "ESSAY_33475", "ESSAY_99999", "ESSAY_00001"]
         hashes = {hash_essay_id(i) for i in ids}
         assert len(hashes) == len(ids), f"hash collision: {hashes}"
+
+
+class TestAuditFile:
+    FIXTURES = Path(__file__).parent / "fixtures"
+
+    def test_clean_fixture_returns_zero_detections(self):
+        from pipelines.audit_pii import audit_file
+
+        report = audit_file(str(self.FIXTURES / "essay_clean.json"))
+        assert report["pii_count"] == 0
+        assert report["hits"] == []
+        assert report["essay_id_original"] == "ESSAY_33474"
+        assert len(report["essay_id_hashed"]) == 16
+
+    def test_pii_fixture_detects_at_least_four_categories(self):
+        from pipelines.audit_pii import audit_file
+
+        report = audit_file(str(self.FIXTURES / "essay_with_pii.json"))
+        types = {h["type"] for h in report["hits"]}
+        assert {"phone", "email", "school", "person_name"}.issubset(types), f"missing types: {types}"
+        assert report["pii_count"] >= 4
+        assert report["essay_id_original"] == "ESSAY_99999"
+
+    def test_report_includes_relative_path(self):
+        from pipelines.audit_pii import audit_file
+
+        report = audit_file(str(self.FIXTURES / "essay_clean.json"))
+        assert report["path"].endswith("essay_clean.json")
+
+    def test_rejects_non_dict_json(self, tmp_path):
+        from pipelines.audit_pii import audit_file
+        bad = tmp_path / "bad.json"
+        bad.write_text("[]", encoding="utf-8")
+        with pytest.raises(ValueError, match="Expected JSON object"):
+            audit_file(str(bad))
