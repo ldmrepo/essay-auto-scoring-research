@@ -193,3 +193,68 @@ class TestMirrorFiles:
 
         with pytest.raises(ValueError, match="not under src_root"):
             mirror_files([outside], src_root=src_root, dst_root=tmp_path / "dst")
+
+
+class TestExtractCli:
+    def _build_dataset(self, root: Path) -> None:
+        """48 essays across 8 strata (2 type × 2 grade × 2 level × 6 ids = 48 total)."""
+        eid = 0
+        for et in ("글짓기", "주장"):
+            for gg in ("초등", "중등"):
+                for lvl in ("1", "2"):
+                    for _ in range(6):  # 6 essays per stratum, 8 strata = 48 total
+                        eid += 1
+                        _write_essay(root, et, gg, lvl, f"ESSAY_{eid:03d}")
+
+    def test_end_to_end_extracts_target_count_with_manifest(self, tmp_path):
+        from pipelines.extract_5k import _main
+
+        src_root = tmp_path / "src" / "라벨링데이터"
+        dst_root = tmp_path / "out"
+        self._build_dataset(src_root)
+
+        rc = _main([
+            str(src_root.parent),  # walk script accepts the labeled-data root container
+            "--out", str(dst_root),
+            "--target-n", "16",
+            "--seed", "42",
+        ])
+        assert rc == 0
+
+        # Output mirrors the src tree under dst_root
+        copied = list(dst_root.rglob("*.json"))
+        # 16 essay copies + 1 manifest.json (manifest may live in dst_root top-level)
+        json_files = [p for p in copied if p.name != "manifest.json"]
+        assert len(json_files) == 16
+
+        # Manifest exists with expected schema
+        manifest_path = dst_root / "manifest.json"
+        assert manifest_path.is_file()
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        assert manifest["target_n"] == 16
+        assert manifest["actual_n"] == 16
+        assert manifest["seed"] == 42
+        assert "by_stratum" in manifest
+        # 8 strata × 2 essays each (16/8) = 2 per stratum
+        assert all(v == 2 for v in manifest["by_stratum"].values())
+
+    def test_deterministic_end_to_end(self, tmp_path):
+        from pipelines.extract_5k import _main
+
+        src = tmp_path / "src" / "라벨링데이터"
+        self._build_dataset(src)
+
+        out1 = tmp_path / "o1"
+        out2 = tmp_path / "o2"
+        _main([str(src.parent), "--out", str(out1), "--target-n", "16", "--seed", "42"])
+        _main([str(src.parent), "--out", str(out2), "--target-n", "16", "--seed", "42"])
+
+        files1 = sorted(p.name for p in out1.rglob("*.json") if p.name != "manifest.json")
+        files2 = sorted(p.name for p in out2.rglob("*.json") if p.name != "manifest.json")
+        assert files1 == files2
+
+    def test_missing_src_returns_error(self, tmp_path):
+        from pipelines.extract_5k import _main
+
+        rc = _main([str(tmp_path / "does_not_exist"), "--out", str(tmp_path / "o"), "--target-n", "5"])
+        assert rc == 2

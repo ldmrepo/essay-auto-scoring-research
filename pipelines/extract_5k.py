@@ -9,9 +9,11 @@ Read-only over the input. Deterministic given a seed.
 
 from __future__ import annotations
 
+import json
 import random
 import shutil
-from collections import defaultdict
+import sys
+from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Callable, Iterable, List, Sequence, Tuple, TypeVar
 
@@ -87,3 +89,98 @@ def mirror_files(paths: Sequence[Path], src_root: Path, dst_root: Path) -> None:
         out = dst_root / rel
         out.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(p_resolved, out)
+
+
+def write_manifest(
+    selected_paths: Sequence[Path],
+    src_root: Path,
+    dst_root: Path,
+    target_n: int,
+    seed: int,
+) -> dict:
+    """Write manifest.json to dst_root and return the manifest dict.
+
+    Schema:
+      root, src_root, target_n, actual_n, seed, by_stratum (str_key -> count), files[]
+    """
+    by_stratum: Counter = Counter()
+    files: List[str] = []
+    src_root_resolved = Path(src_root).resolve()
+    for p in selected_paths:
+        doc = json.loads(Path(p).read_text(encoding="utf-8"))
+        key = "|".join(extract_strat_keys(doc))
+        by_stratum[key] += 1
+        files.append(str(Path(p).resolve().relative_to(src_root_resolved)))
+
+    manifest = {
+        "root": str(Path(dst_root).resolve()),
+        "src_root": str(src_root_resolved),
+        "target_n": target_n,
+        "actual_n": len(selected_paths),
+        "seed": seed,
+        "by_stratum": dict(by_stratum),
+        "files": files,
+    }
+    dst_root = Path(dst_root)
+    dst_root.mkdir(parents=True, exist_ok=True)
+    (dst_root / "manifest.json").write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    return manifest
+
+
+def _main(argv: List[str] | None = None) -> int:
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        prog="python3 -m pipelines.extract_5k",
+        description="Extract stratified subsample (target ≈ 5K) from labeled essay tree.",
+    )
+    parser.add_argument(
+        "src",
+        help="Source root containing 라벨링데이터/<essay_type>/*.json (e.g. dataset/1.Training)",
+    )
+    parser.add_argument("--out", required=True, help="Output root for mirrored subsample")
+    parser.add_argument("--target-n", type=int, default=5000, help="Target sample size")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed for determinism")
+    args = parser.parse_args(argv)
+
+    src = Path(args.src)
+    if not src.is_dir():
+        sys.stderr.write(f"ERROR: src does not exist or is not a directory: {src}\n")
+        return 2
+
+    # Walk src for *.json (typically under 라벨링데이터/)
+    all_paths = sorted(src.rglob("*.json"))
+    if not all_paths:
+        sys.stderr.write(f"ERROR: no .json files found under {src}\n")
+        return 2
+
+    # Pair (path, key) for stratification
+    annotated: List[Tuple[Path, Tuple[str, str, str]]] = []
+    for p in all_paths:
+        try:
+            doc = json.loads(p.read_text(encoding="utf-8"))
+            key = extract_strat_keys(doc)
+        except (json.JSONDecodeError, KeyError, OSError):
+            continue
+        annotated.append((p, key))
+
+    selected = stratified_sample(
+        annotated, key_fn=lambda x: x[1], target_n=args.target_n, seed=args.seed
+    )
+    selected_paths = [p for p, _ in selected]
+
+    out = Path(args.out)
+    mirror_files(selected_paths, src_root=src, dst_root=out)
+    manifest = write_manifest(selected_paths, src_root=src, dst_root=out, target_n=args.target_n, seed=args.seed)
+
+    print(
+        f"extracted {manifest['actual_n']} / target {manifest['target_n']} "
+        f"across {len(manifest['by_stratum'])} strata -> {out}"
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(_main())
