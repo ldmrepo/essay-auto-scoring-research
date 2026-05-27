@@ -41,3 +41,6 @@ venv/
 .env
 .env.*
 !.env.example
+
+# 5K stratified subsample (43M, deterministic from extract_5k.py seed=42)
+dataset/sample_5k/
