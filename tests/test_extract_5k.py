@@ -117,3 +117,79 @@ class TestStratifiedSample:
         from pipelines.extract_5k import stratified_sample
 
         assert stratified_sample([], key_fn=lambda x: x[0], target_n=10, seed=42) == []
+
+
+def _write_essay(root: Path, essay_type: str, grade_group: str, level: str, essay_id: str) -> Path:
+    """Create a single essay json under root/<essay_type>/<filename> mirroring real schema."""
+    sub = root / essay_type
+    sub.mkdir(parents=True, exist_ok=True)
+    path = sub / f"{essay_type}_{grade_group}_{essay_id}.json"
+    doc = {
+        "info": {
+            "essay_id": essay_id,
+            "essay_type": essay_type,
+            "essay_level": level,
+            "essay_prompt": "테스트",
+            "essay_len": 50,
+        },
+        "student": {
+            "student_grade_group": grade_group,
+            "student_grade": f"{grade_group}_1학년",
+            "location": "001",
+        },
+        "paragraph": [{"paragraph_txt": "테스트 본문", "paragraph_id": "001"}],
+        "score": {"essay_scoreT_avg": 20.0},
+    }
+    path.write_text(json.dumps(doc, ensure_ascii=False), encoding="utf-8")
+    return path
+
+
+class TestMirrorFiles:
+    def test_mirrors_directory_tree(self, tmp_path):
+        from pipelines.extract_5k import mirror_files
+
+        src_root = tmp_path / "src"
+        dst_root = tmp_path / "dst"
+        a = _write_essay(src_root, "글짓기", "초등", "1", "ESSAY_A")
+        b = _write_essay(src_root, "주장", "중등", "2", "ESSAY_B")
+
+        mirror_files([a, b], src_root=src_root, dst_root=dst_root)
+
+        assert (dst_root / "글짓기" / "글짓기_초등_ESSAY_A.json").is_file()
+        assert (dst_root / "주장" / "주장_중등_ESSAY_B.json").is_file()
+
+    def test_skips_source_root_prefix(self, tmp_path):
+        # The output path strips the src_root prefix and reuses everything below.
+        from pipelines.extract_5k import mirror_files
+
+        src_root = tmp_path / "deep" / "nested" / "src"
+        dst_root = tmp_path / "out"
+        a = _write_essay(src_root, "설명글", "고등", "3", "ESSAY_C")
+
+        mirror_files([a], src_root=src_root, dst_root=dst_root)
+        assert (dst_root / "설명글" / "설명글_고등_ESSAY_C.json").is_file()
+        # No accidental nesting under "deep/nested/src"
+        assert not (dst_root / "deep").exists()
+
+    def test_preserves_file_contents(self, tmp_path):
+        from pipelines.extract_5k import mirror_files
+
+        src_root = tmp_path / "src"
+        dst_root = tmp_path / "dst"
+        a = _write_essay(src_root, "찬성반대", "중등", "2", "ESSAY_D")
+        original = a.read_text(encoding="utf-8")
+
+        mirror_files([a], src_root=src_root, dst_root=dst_root)
+        copied = (dst_root / "찬성반대" / "찬성반대_중등_ESSAY_D.json").read_text(encoding="utf-8")
+        assert copied == original
+
+    def test_raises_when_path_outside_src_root(self, tmp_path):
+        from pipelines.extract_5k import mirror_files
+
+        src_root = tmp_path / "src"
+        src_root.mkdir()
+        outside = tmp_path / "outside.json"
+        outside.write_text("{}", encoding="utf-8")
+
+        with pytest.raises(ValueError, match="not under src_root"):
+            mirror_files([outside], src_root=src_root, dst_root=tmp_path / "dst")

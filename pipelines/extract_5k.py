@@ -10,8 +10,10 @@ Read-only over the input. Deterministic given a seed.
 from __future__ import annotations
 
 import random
+import shutil
 from collections import defaultdict
-from typing import Callable, Iterable, List, Tuple, TypeVar
+from pathlib import Path
+from typing import Callable, Iterable, List, Sequence, Tuple, TypeVar
 
 
 def extract_strat_keys(doc: dict) -> Tuple[str, str, str]:
@@ -65,3 +67,23 @@ def stratified_sample(
         if n > 0:
             sampled.extend(rng.sample(group, n))
     return sampled
+
+
+def mirror_files(paths: Sequence[Path], src_root: Path, dst_root: Path) -> None:
+    """Copy each input path to `dst_root / <path relative to src_root>`.
+
+    Raises ValueError if any path is not under src_root.
+    Creates parent directories as needed. Overwrites existing dst files.
+    """
+    src_root = Path(src_root).resolve()
+    dst_root = Path(dst_root).resolve()
+
+    for p in paths:
+        p_resolved = Path(p).resolve()
+        try:
+            rel = p_resolved.relative_to(src_root)
+        except ValueError as e:
+            raise ValueError(f"not under src_root: {p} (src_root={src_root})") from e
+        out = dst_root / rel
+        out.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(p_resolved, out)
