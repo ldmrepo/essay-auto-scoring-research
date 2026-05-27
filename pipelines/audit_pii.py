@@ -7,6 +7,7 @@ as group key, student_grade_group as stratify key) are preserved.
 
 from __future__ import annotations
 
+import hashlib
 import re
 from typing import List, TypedDict
 
@@ -64,3 +65,13 @@ def detect_pii(text: str) -> List[PiiHit]:
             continue  # filter common nouns to reduce false positives in K-12 essays
         hits.append({"type": "person_name", "match": name, "start": m.start(1), "end": m.end(1)})
     return hits
+
+
+def hash_essay_id(essay_id: str) -> str:
+    """SHA-256 prefix (16 hex chars) for masked-export essay_id.
+
+    Deterministic and reversible (no salt). Use for audit traceability
+    on copies sent to remote compute, not adversarial anonymization.
+    """
+    digest = hashlib.sha256(essay_id.encode("utf-8")).hexdigest()
+    return digest[:16]

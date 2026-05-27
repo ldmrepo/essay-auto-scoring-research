@@ -48,3 +48,24 @@ class TestDetectPii:
         text = "주문번호 0101234567812345"
         hits = [h for h in detect_pii(text) if h["type"] == "phone"]
         assert hits == [], f"phone over-match: {hits}"
+
+
+class TestHashEssayId:
+    def test_returns_16_char_lowercase_hex(self):
+        from pipelines.audit_pii import hash_essay_id
+
+        out = hash_essay_id("ESSAY_33474")
+        assert len(out) == 16
+        assert all(c in "0123456789abcdef" for c in out)
+
+    def test_is_deterministic(self):
+        from pipelines.audit_pii import hash_essay_id
+
+        assert hash_essay_id("ESSAY_33474") == hash_essay_id("ESSAY_33474")
+
+    def test_distinct_ids_produce_distinct_hashes(self):
+        from pipelines.audit_pii import hash_essay_id
+
+        ids = ["ESSAY_33474", "ESSAY_33475", "ESSAY_99999", "ESSAY_00001"]
+        hashes = {hash_essay_id(i) for i in ids}
+        assert len(hashes) == len(ids), f"hash collision: {hashes}"

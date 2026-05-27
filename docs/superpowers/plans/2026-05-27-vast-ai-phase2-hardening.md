@@ -462,7 +462,11 @@ from typing import List, TypedDict
 
 
 def hash_essay_id(essay_id: str) -> str:
-    """Deterministic SHA-256 prefix (16 hex chars). Use for masked-export essay_id."""
+    """SHA-256 prefix (16 hex chars) for masked-export essay_id.
+
+    Deterministic and reversible (no salt). Use for audit traceability
+    on copies sent to remote compute, not adversarial anonymization.
+    """
     digest = hashlib.sha256(essay_id.encode("utf-8")).hexdigest()
     return digest[:16]
 ```
