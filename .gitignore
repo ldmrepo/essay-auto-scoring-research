@@ -36,3 +36,8 @@ venv/
 
 # Windows ADS (WSL)
 *:Zone.Identifier
+
+# Secrets — never commit
+.env
+.env.*
+!.env.example
