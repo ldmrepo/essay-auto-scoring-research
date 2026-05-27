@@ -34,7 +34,7 @@ _SCHOOL_RE = re.compile(r"[가-힣]{2,}(?:초등학교|중학교|고등학교|�
 # Conservative: only matches when preceded by "저는 "/"이름은 "/"제 이름은 " context
 # to reduce false positives on common nouns.
 _NAME_RE = re.compile(
-    r"(?:저는|이름은|제\s*이름은)\s+([가-힣]{2,3})(?=입니다|이고|이며|이에요|이라|\s|$|[.,])"
+    r"(?:저는|이름은|제\s*이름은)\s+([가-힣]{2,3})(?=입니다|이고|이며|이에요|이라|[.,])"
 )
 
 # Common occupation/role/relation nouns that appear after trigger phrases in K-12 essays.
@@ -48,6 +48,8 @@ _COMMON_NOUNS_AFTER_TRIGGER = frozenset({
     "남동생", "여동생", "아들", "딸", "친구", "남편", "아내",
     # Generic identifiers
     "어른", "어린이", "청소년", "초등학생", "중학생", "고등학생", "대학생",
+    # Common nouns confirmed false-positive in Task 6 sample audit (168 hits regression)
+    "미역", "천사", "온난화", "비혼",
 })
 
 
@@ -109,3 +111,61 @@ def audit_file(path: str) -> dict:
         "essay_id_original": essay_id,
         "essay_id_hashed": hash_essay_id(essay_id) if essay_id else "",
     }
+
+
+def audit_directory(root: str) -> dict:
+    """Walk root recursively, audit each `*.json` essay file, return aggregate report."""
+    root_path = Path(root)
+    per_file: List[dict] = []
+    for json_path in sorted(root_path.rglob("*.json")):
+        try:
+            report = audit_file(str(json_path))
+        except (json.JSONDecodeError, OSError, ValueError):
+            continue
+        per_file.append(report)
+
+    return {
+        "root": str(root_path),
+        "total_files": len(per_file),
+        "files_with_pii": sum(1 for r in per_file if r["pii_count"] > 0),
+        "total_pii_hits": sum(r["pii_count"] for r in per_file),
+        "per_file": per_file,
+    }
+
+
+def _main(argv: List[str] | None = None) -> int:
+    import argparse
+    import sys
+
+    parser = argparse.ArgumentParser(
+        prog="python3 -m pipelines.audit_pii",
+        description="Audit essay JSON files for PII before uploading to external compute (e.g. vast.ai).",
+    )
+    parser.add_argument("root", help="Directory to walk recursively for *.json essay files")
+    parser.add_argument(
+        "--report", default="pii_audit_report.json", help="Output JSON report path"
+    )
+    parser.add_argument(
+        "--fail-on-hit",
+        action="store_true",
+        help="Exit with non-zero status if any PII is detected (use in CI/upload gate)",
+    )
+    args = parser.parse_args(argv)
+
+    result = audit_directory(args.root)
+    Path(args.report).write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    print(
+        f"audited {result['total_files']} files, "
+        f"{result['files_with_pii']} with PII, "
+        f"{result['total_pii_hits']} hits -> {args.report}"
+    )
+
+    if args.fail_on_hit and result["total_pii_hits"] > 0:
+        sys.stderr.write("ERROR: PII detected — upload blocked.\n")
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(_main())

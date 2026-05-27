@@ -44,6 +44,18 @@ class TestDetectPii:
             hits = [h for h in detect_pii(text) if h["type"] == "person_name"]
             assert hits == [], f"false positive on {text!r}: {hits}"
 
+    def test_does_not_flag_object_particle_after_trigger(self):
+        # K-12 essays: "저는 [명사를/명사에] ~~한다" 패턴 false positive 방지
+        # 조사가 lookahead의 \s|$를 트리거하면 안 됨 (Task 6 sample audit 168 hits 회귀 방지)
+        for text in (
+            "저는 과자를 좋아한다.",
+            "저는 매일 학교에 간다.",
+            "저는 바다에서 수영을 한다.",
+            "저는 친구와 영화를 봤다.",
+        ):
+            hits = [h for h in detect_pii(text) if h["type"] == "person_name"]
+            assert hits == [], f"false positive on {text!r}: {hits}"
+
     def test_does_not_overmatch_phone_in_long_digit_string(self):
         # 단어 경계 가드: 11자리 휴대전화 패턴이 더 긴 숫자열에 embedded 시 매치 금지.
         text = "주문번호 0101234567812345"
@@ -105,3 +117,30 @@ class TestAuditFile:
         bad.write_text("[]", encoding="utf-8")
         with pytest.raises(ValueError, match="Expected JSON object"):
             audit_file(str(bad))
+
+
+class TestAuditDirectory:
+    FIXTURES = Path(__file__).parent / "fixtures"
+
+    def test_aggregates_two_files(self, tmp_path):
+        from pipelines.audit_pii import audit_directory
+
+        sub = tmp_path / "원천데이터" / "글짓기"
+        sub.mkdir(parents=True)
+        for name in ("essay_clean.json", "essay_with_pii.json"):
+            (sub / name).write_text(
+                (self.FIXTURES / name).read_text(encoding="utf-8"), encoding="utf-8"
+            )
+
+        result = audit_directory(str(tmp_path))
+        assert result["total_files"] == 2
+        assert result["files_with_pii"] == 1
+        assert result["total_pii_hits"] >= 4
+        assert len(result["per_file"]) == 2
+
+    def test_empty_directory_returns_zero_files(self, tmp_path):
+        from pipelines.audit_pii import audit_directory
+
+        result = audit_directory(str(tmp_path))
+        assert result["total_files"] == 0
+        assert result["per_file"] == []
