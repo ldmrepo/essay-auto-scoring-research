@@ -1,7 +1,8 @@
 # Phase 3 작업 계획 (Multi-task M5/M6 진입)
 
-> **버전**: v1.0
+> **버전**: v1.2
 > **작성 일자**: 2026-05-28
+> **상태**: Stage 1 WIRE-UP 완료 (`ACCEPTANCE_CRITERIA.yaml stages.mid_multitask._implementation_status: wired_v1`). Stage 2 M2 본 cycle을 새 Hermes 보드 `essay-auto-scoring-research-phase3`에서 진행. M2R POLICY v3로 split fallback / 실행 정책 보완.
 > **선행 commit**: `fefd4fa feat(phase-3): Phase 3 multi-task 진입 준비 — 12 산출 + 6 사이클 검수 종결`
 > **선행 문서**:
 > - `MILESTONE_v3.md` — Phase 3 goal anchor + success criteria
@@ -18,12 +19,12 @@
 | Stage | 작업 | 자율 가능 | 게이트 |
 |---|---|---|---|
 | **0** | 사전 준비 (cron / alert / preflight / dataset 재생성) | 부분 (cron/dataset은 사용자 결정) | 환경 영향 |
-| **1** | **M2 WIRE-UP cycle (evaluate.py multi-task 분기 + tests)** | **본 작업 범위** | tests 통과 후 commit |
-| 2 | M2 본격 9 sub-task (AUDIT → SYNTH) — vast.ai 학습 포함 | × (kanban + 비용 발생) | 사용자 명시 |
+| **1** | **M2 WIRE-UP cycle (evaluate.py multi-task helper + tests)** | 완료 | `wired_v1` |
+| **2** | **M2 본격 8 worker sub-task + DECIDE (AUDIT → SYNTH)** — vast.ai 학습 포함 | 진행 | 새 Phase 3 보드 등록 |
 | 3 | M3+ 반복 자가발전 chain | × (DECIDE 게이트) | DECIDE 사용자 또는 auto_continue |
 | 4 | Phase 3 종료 (acceptance 통과) | × | acceptance 충족 후 사용자 [Phase-up] DECIDE |
 
-**본 commit 진행 범위**: Stage 1 WIRE-UP cycle만. Stage 0의 자동 부분 + Stage 1 코드/테스트 + ACCEPTANCE wired_v1 갱신.
+**현재 진행 범위**: Stage 2 M2 본 cycle을 Hermes Kanban native dependency로 등록하고 AUDIT부터 진행.
 
 ---
 
@@ -37,21 +38,21 @@
 | 0-4 | hermes 패치 검증 | `bash scripts/verify_hermes_patch.sh --show-hash` |
 | 0-8 | cycle_preflight dry-run | `bash scripts/cycle_preflight.sh M2` (warns 모니터) |
 
-### 1.2 사용자 결정 필요 (게이트)
+### 1.2 사용자 결정 필요 또는 후속 보강
 
 | # | 항목 | 사유 |
 |---|---|---|
-| 0-2 | cron 등록 (6h 자동 백업) | 사용자 crontab 변경, 영구 효과 |
-| 0-3 | 알림 채널 활성 (notify-send 또는 webhook/email 설정) | 사용자 환경 + 외부 endpoint 설정 |
-| 0-5 | `.git/FETCH_HEAD` root 권한 정리 (`sudo chown -R dev:dev .git`) | sudo 권한 |
-| 0-6 | dataset 재생성 (`--validate-rubric`) | I/O 비용 (39,591건 stream 처리, drift 통계 산출) |
+| 0-2 | cron 등록 (6h 자동 백업) | 사용자 crontab 변경, 영구 효과. 미등록은 preflight WARN |
+| 0-3 | 알림 push 채널 활성 (notify-send 또는 webhook/email 설정) | 현재 기본은 durable file-log. push 강제 시 `push_required_count: 1` |
+| 0-5 | `.git/FETCH_HEAD` root 권한 정리 | 현재 `git status` 정상, 필요 시만 수행 |
+| 0-6 | dataset 재생성 (`--validate-rubric`) | M2 AUDIT/SPLIT에서 실행 가능. I/O 비용 존재 |
 | 0-7 | manifest.drift_skipped 검토 | 0이 아니면 사용자 판단 |
 
 ---
 
 ## 2. Stage 1 — M2 WIRE-UP cycle (본 작업 메인)
 
-`ACCEPTANCE_CRITERIA.yaml stages.mid_multitask._implementation_status: not_wired_yet → wired_v1`로 전환하는 단일 cycle.
+완료 상태. `ACCEPTANCE_CRITERIA.yaml stages.mid_multitask._implementation_status: wired_v1`.
 
 ### 2.1 변경 파일
 
@@ -87,12 +88,14 @@ def auto_continue_check(
 
 ### 2.3 wire-up 의무 항목 (ACCEPTANCE `_wire_up_required` 6항목)
 
-- [ ] pipelines/evaluate.py에 mid_multitask 분기 추가 (현재 toy 단일 분기만 존재)
-- [ ] 차원별 score_band cutoff 함수 추가 (T1-04, score_band_per_rubric)
-- [ ] fairness_gate_per_rubric() 함수 + 차원별 lower95 계산
-- [ ] auto_continue 조건 evaluator/SYNTH 양측 구현
-- [ ] wire-up 완료 후 _implementation_status를 wired_v1로 변경 + Phase 3 M2 SYNTH 검증
-- [ ] cycle_preflight.sh [11/12]가 wired_v1 확인 후에만 M3+ 진입 허용
+- [x] pipelines/evaluate.py에 Phase 3 helper 추가
+- [x] 차원별 score_band cutoff 함수 추가 (`score_band_per_rubric`)
+- [x] fairness_gate_per_rubric() 함수 + 차원별 metric 구조 추가
+- [x] auto_continue_check helper 추가
+- [x] wire-up 완료 후 _implementation_status를 wired_v1로 변경
+- [x] cycle_preflight.sh [11/12]가 wired_v1 확인 후에만 M3+ 진입 허용
+- [ ] Phase 3 M2 SYNTH에서 cycle_report.json 표준 schema와 auto_continue_check 호출 의무 확인
+- [ ] Phase 3 EVAL executable path에서 `fairness_gate_per_rubric()` 호출 확인. helper-only dead code 또는 overall-only `fairness_gate()` main path면 acceptance hard-block.
 
 ### 2.4 검증
 
@@ -113,19 +116,21 @@ def auto_continue_check(
 
 ## 3. Stage 2 — M2 본격 cycle (사용자 게이트 후)
 
-본 작업 범위 외 (cron + vast.ai 비용 + DECIDE 게이트 필요).
+현재 진행 대상. 새 보드 `essay-auto-scoring-research-phase3`에 WIRE-UP evidence task와 M2 chain을 등록한다.
 
 ### 3.1 진입 조건
 
-- Stage 1 WIRE-UP commit + push 완료
-- Stage 0 사용자 결정 항목 (0-2/0-3/0-6) 처리
-- `bash scripts/cycle_preflight.sh M2 --require-vast --auto-destroy-stale --vast-label essay-auto-scoring` fails=0
+- Stage 1 WIRE-UP 완료 (`wired_v1`)
+- 새 Phase 3 보드 생성 및 active 전환 완료
+- `bash scripts/cycle_preflight.sh M2 --require-vast` fails=0
+- cron/auto backup 미등록은 WARN으로 허용하되 M2 AUDIT에서 재보고
 
 ### 3.2 sub-task chain (kanban native dependency)
 
 ```
+T-CYCLE-M2-WIRE-UP   (gauss+turing)  ← evidence task, 완료 처리
 T-CYCLE-M2-AUDIT     (tukey)         ← preflight + MILESTONE_v3 goal 재주입
-T-CYCLE-M2-SPLIT     (gauss)         ← k=5, valid_n ≥ 300
+T-CYCLE-M2-SPLIT     (gauss)         ← default student.location + k=5; fallback region merge + k=3 if valid_n hard-block evidence exists
 T-CYCLE-M2-FEATURE   (gauss)         ← TF-IDF + RoBERTa CLS cache + provenance
 T-CYCLE-M2-MODEL     (gauss)         ← M1~M4 + M5 multi-task (vast.ai off-worker)
 T-CYCLE-M2-HPO       (gauss)         ← Optuna 30 trial+ (M2 단독)
@@ -135,7 +140,35 @@ T-CYCLE-M2-SYNTH     (aristotle)     ← cycle_report.json + 다음 cycle 등록
 DECIDE-M2            (사용자/auto)
 ```
 
-### 3.3 비용 추정
+의존성:
+- `WIRE-UP(done) → AUDIT → SPLIT → FEATURE → MODEL → HPO`
+- `HPO → EVAL`, `HPO → REVIEW`
+- `EVAL + REVIEW → SYNTH → DECIDE-M2`
+
+### 3.3 split fallback policy (M2R POLICY v3)
+
+기본 attempt는 `student.location + k=5`이다. 기본 split 산출에서 fold 중 하나라도 `valid_n >= 300`을 위반하면 M2에 한해 승인된 fallback `region merge + k=3`을 사용할 수 있다.
+
+fallback acceptance 조건:
+- `group_overlap_count=0`
+- `student.location`은 split-only metadata로만 유지하고 모델 입력에 포함하지 않음
+- `min_valid_n >= 300`
+- evidence에 실패한 기본 split report와 승인된 fallback split manifest를 모두 포함
+
+검증 명령 예시:
+
+```bash
+python3 pipelines/make_splits.py --input dataset/sample_5k/ --k 5 --output workspace/cycle_M2/splits/default_k5 --cycle-id M2 --group-key student.location --min-valid-n 300
+python3 pipelines/make_splits.py --input dataset/sample_5k/ --k 3 --output workspace/cycle_M2/splits/region_k3 --cycle-id M2 --group-key region --min-valid-n 300
+```
+
+### 3.4 execution policy gates
+
+- Long-running MODEL/HPO task bodies must include literal `expected_duration_min > 10` plus off-worker detach and one-shot polling instructions.
+- M5/M6 Phase 3 must be multi-task only. scalar M5/HPO fallback is forbidden, including `pipelines/train_transformer.py` `num_labels=1` scalar acceptance path.
+- EVAL executable path must call `fairness_gate_per_rubric()` for Phase 3 per-rubric fairness. Helper-only dead code or overall-only `fairness_gate()` output is not acceptable.
+
+### 3.5 비용 추정
 
 - vast.ai RTX 3060 (8GB VRAM): cycle당 ~1.5h × $0.10/h ≈ $0.15
 - Optuna HPO 30 trial: ~3h × $0.10/h ≈ $0.30
@@ -145,7 +178,7 @@ DECIDE-M2            (사용자/auto)
 
 ## 4. Stage 3 — M3+ 반복 (자가발전 chain)
 
-- SYNTH가 다음 cycle 9 sub-task + DECIDE 자동 등록
+- SYNTH가 다음 cycle 8 worker sub-task + DECIDE 자동 등록
 - HPO 누적 50+ trial 도달 (M2 30 + M3 10 + M4 10)
 - PASS_CANDIDATE 2회 + 개선 < 0.01 시 FAIL_STOP_NO_GAIN escalation
 - grace_cycles=3 (M2~M4 면제) → M5+ evolution_progress_required 본격 평가
@@ -162,8 +195,8 @@ DECIDE-M2            (사용자/auto)
 4. M6 > M5 strict (overall)
 5. All-dimension fairness gate (× 0.7)
 6. HPO 누적 trial ≥ 50
-7. fold valid_n ≥ 300
-8. judgement: PASS_CANDIDATE / PASS_FINAL
+7. fold valid_n ≥ 300 (default `student.location + k=5`; M2 fallback `region merge + k=3` only with default failure evidence)
+8. judgement: PASS_CANDIDATE (`final_judgement_allowed: false`)
 9. per-rubric monotone regression = 0
 10. evaluator wire-up: wired_v1
 
@@ -194,17 +227,17 @@ DECIDE-M2            (사용자/auto)
 
 | # | 단계 | 명령 / 산출 |
 |---|---|---|
-| W0 | 작업 계획 문서 (본 문서) | `docs/plans/PHASE3_WORK_PLAN_v_1_0.md` |
-| W1 | evaluate.py wire-up | mid_multitask 분기 + 3 helper 함수 |
-| W2 | tests/test_evaluate_phase3.py | unit test 8건+ |
-| W3 | train_transformer.py validate 호출 | `validate_rubric_for_phase3` 사전 검증 |
-| W4 | ACCEPTANCE_CRITERIA wired_v1 | tests 통과 후 갱신 |
-| W5 | commit + push | Stage 1 단일 commit |
+| W0 | 작업 계획 문서 최신화 | `docs/plans/PHASE3_WORK_PLAN_v_1_0.md` v1.2 |
+| W1 | 새 Phase 3 보드 확인 | `hermes kanban boards show` |
+| W2 | preflight | `scripts/cycle_preflight.sh M2 --require-vast` |
+| W3 | WIRE-UP evidence task 등록/완료 | `T-CYCLE-M2-WIRE-UP` |
+| W4 | M2 worker chain 등록 | AUDIT/SPLIT/FEATURE/MODEL/HPO/EVAL/REVIEW/SYNTH/DECIDE |
+| W5 | dispatcher 진행 확인 | `hermes kanban stats`, `hermes kanban list` |
 
-W5 완료 후 사용자 결정:
-- Stage 2 진입 (M2 본격 cycle, kanban + vast.ai)
-- 또는 Stage 0 잔여 (cron / dataset 재생성) 처리 후 진입
-- 또는 일시 대기
+W5 완료 후:
+- AUDIT task가 ready/todo 상태에서 dispatcher 대상이 된다.
+- M2 MODEL/HPO에서 vast.ai 비용이 발생하므로 cost circuit breaker와 progress polling을 필수 적용한다.
+- DECIDE-M2에서 `[Continue]`, `[Phase-up]`, `[Stop]` 중 하나를 기록한다.
 
 ---
 
@@ -214,7 +247,7 @@ W5 완료 후 사용자 결정:
 - `docs/multi_task_채점모델_구현_스펙_v_1_1.md` v1.1.5 § 6 / § 11.2 / § 14
 - `docs/phase_3_operations_guide_v_1_0.md` v1.0.3 § 1 / § 6
 - `ACCEPTANCE_CRITERIA.yaml stages.mid_multitask`
-- `AGENTS.md` Hard Rule #15~#18 + 9 sub-task pattern
+- `AGENTS.md` Hard Rule #15~#18 + 8 worker sub-task + DECIDE pattern
 - `scripts/cycle_preflight.sh` [11/12] wire-up check
 - `pipelines/evaluate.py` (current toy 분기만, mid_multitask 분기 wire-up 대상)
 - `pipelines/extract_5k.py:validate_rubric_for_phase3` (사전 검증 헬퍼)

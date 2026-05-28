@@ -50,7 +50,7 @@ ACCEPTANCE_CRITERIA.yaml `stages.mid_multitask` 본문 mapping. 본 표는 T3-01
 | 4 | M6 > M5 strict (overall) | strict | #5 | 동상 |
 | 5 | **All-dimension** fairness gate (exp/org/cont 각 native 0~3 + overall raw 0~30 — 각 `worst_band_qwk ≥ macro_qwk × 0.7`) | × 0.7 | #14 (확장), #15 | `fairness_gate.unit_per_dimension` + score_band_cutoffs |
 | 6 | Optuna HPO trial 수 (M2 단독 30+, M3+ 누적 50+ 및 cycle당 5+ 추가) | M2: 30 / M3+: 50 | #12 | optuna study `len(study.trials)` + cycle delta |
-| 7 | 모든 fold valid_n ≥ 300 (k=5) | 300 | SPLIT | `make_splits.py` manifest |
+| 7 | 모든 fold valid_n ≥ 300 (default `student.location + k=5`; M2 fallback `region merge + k=3` 허용) | 300 | SPLIT | 기본 split 실패 report + fallback split manifest |
 | 8 | judgement: PASS_CANDIDATE | enum | — | SYNTH cycle report (`final_judgement_allowed: false` 정합) |
 | 9 | **차원별 단조 후퇴 0건** (T1-05 신설) | 0 | #15 | `per_rubric_monotone_evolution.warn_condition` |
 | 10 | **evaluator wire-up 완료** (T1-03 신설, Phase 3 M2 진입 게이트) | true | (운영) | `mid_multitask._implementation_status == wired_v1` |
@@ -64,6 +64,7 @@ T-CYCLE-M2-WIRE-UP (gauss + turing) — Phase 3 evaluator + acceptance wire-up
   ├── pipelines/evaluate.py에 mid_multitask 분기 추가
   ├── score_band_per_rubric() 함수 (T1-04 cutoff 적용)
   ├── fairness_gate_per_rubric() 함수 + 차원별 lower95
+  ├── evaluate.py main executable path가 mid_multitask stage에서 fairness_gate_per_rubric()를 호출 (helper-only dead code 금지)
   ├── auto_continue 평가 로직 — R2-NEW-G3/G4/G5 fix 명시:
   │     - consecutive_pass_candidate_max: 2
   │     - evolution_progress_required.window_cycles=2 + grace_cycles=3
@@ -75,6 +76,18 @@ T-CYCLE-M2-WIRE-UP (gauss + turing) — Phase 3 evaluator + acceptance wire-up
 ```
 
 위 task 완료 + tests/test_evaluate_phase3.py 통과 후 본격 cycle (AUDIT → SPLIT → ... → SYNTH → DECIDE) 진행.
+
+## M2R Split Fallback Policy (v3)
+
+M2 SPLIT의 default attempt는 `student.location + k=5`이다. default split에서 fold 중 하나라도 `valid_n >= 300`을 위반하면 M2에 한해 승인된 fallback `region merge + k=3`을 사용할 수 있다.
+
+fallback acceptance 조건:
+- `group_overlap_count=0`
+- `student.location`은 split key / leakage audit metadata로만 사용하고 모델 입력에는 포함하지 않음
+- `min_valid_n >= 300`
+- evidence에 실패한 default split report와 승인된 fallback split manifest를 모두 포함
+
+이 fallback은 `valid_n` 안전 게이트를 완화하지 않는다. fold 수와 group granularity만 조정한다.
 
 ---
 
@@ -152,10 +165,12 @@ T-CYCLE-MN-SPLIT     (gauss)
 T-CYCLE-MN-FEATURE   (gauss)
 T-CYCLE-MN-MODEL     (gauss)
   ↓ M5/M6는 off-worker (Hard Rule #16) + progress.json (Hard Rule #17)
+  ↓ MODEL/HPO task body metadata literal: `expected_duration_min > 10` + off-worker/polling instructions
 T-CYCLE-MN-HPO       (gauss)
 T-CYCLE-MN-EVAL      (spearman) ┐
 T-CYCLE-MN-REVIEW    (turing)   ┘ 병렬 (T-HPO parent)
   ↓ per-rubric metric + per-rubric fairness gate (Hard Rule #15)
+  ↓ EVAL executable path must call `fairness_gate_per_rubric()`, not helper-only dead code or overall-only fairness
 T-CYCLE-MN-SYNTH     (aristotle)
   ↓ parent
 DECIDE-MN            (사용자 또는 auto_continue)

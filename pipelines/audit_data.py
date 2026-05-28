@@ -585,7 +585,7 @@ def label_only_audit_report(
 - Label root: `{label_root.as_posix()}/`
 - Layout: Phase 2 label-only sample. Model-visible essay text is stored in `paragraph[].paragraph_txt`.
 - Raw essay text, prompts, paragraphs, and correction text were not copied into audit artifacts.
-- Milestone v2 goal anchor was reinjected by the kanban task body; SHA256 is recorded in `audit_manifest.json`.
+- Active milestone goal anchor was reinjected by the kanban task body; SHA256 is recorded in `audit_manifest.json`.
 
 ## Manifest Sanity
 {manifest_text}
@@ -638,7 +638,6 @@ Label/location imbalance above 5x is expected in this sampled training set and m
 ## Generated Files
 - `{paths["audit_report"]}`
 - `{paths["leakage_check"]}`
-- `{paths["pii_audit"]}`
 - `{paths["target_distribution"]}`
 - `{paths["audit_manifest"]}`
 - `{paths["audit_table_no_raw_text"]}`
@@ -646,7 +645,6 @@ Label/location imbalance above 5x is expected in this sampled training set and m
 ## Verification Commands
 ```bash
 python3 pipelines/audit_data.py --input {input_root.as_posix()} --output-dir {Path(paths["audit_report"]).parent.as_posix()} --cycle-id {cycle_id} --kanban-task-id {summary["task_id"]}
-python3 -m pipelines.audit_pii {input_root.as_posix()} --report {paths["pii_audit"]} --fail-on-hit
 ```
 """
 
@@ -769,7 +767,6 @@ def run_label_only_audit(args: argparse.Namespace, input_root: Path, label_root:
     paths = {
         "audit_report": (output_dir / "audit_report.md").as_posix(),
         "leakage_check": (output_dir / "leakage_check.json").as_posix(),
-        "pii_audit": (output_dir / "pii_audit_M1.json").as_posix(),
         "target_distribution": (output_dir / "target_distribution.csv").as_posix(),
         "audit_manifest": (output_dir / "audit_manifest.json").as_posix(),
         "audit_table_no_raw_text": (output_dir / "audit_table_no_raw_text.csv").as_posix(),
@@ -779,7 +776,14 @@ def run_label_only_audit(args: argparse.Namespace, input_root: Path, label_root:
     target_distribution.to_csv(paths["target_distribution"], index=False)
     write_json(Path(paths["leakage_check"]), leakage)
 
-    milestone_path = Path("MILESTONE_v2.md") if Path("MILESTONE_v2.md").exists() else Path("MILESTONE.md")
+    milestone_path = next(
+        (
+            path
+            for path in [Path("MILESTONE_v3.md"), Path("MILESTONE_v2.md"), Path("MILESTONE.md")]
+            if path.exists()
+        ),
+        Path("MILESTONE.md"),
+    )
     audit_manifest = {
         "task_id": args.kanban_task_id,
         "task_title": f"T-CYCLE-{args.cycle_id}-AUDIT: 데이터 검증",

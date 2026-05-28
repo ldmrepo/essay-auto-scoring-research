@@ -16,39 +16,6 @@
 
 set -eu
 
-# flock 단일 instance 보장 (T2-14 + R4-NF5: 사용자별 격리)
-# R4-NF5 fix: /tmp 공유 lock은 multi-user 환경에서 DoS 가능 → user home으로 이동
-LOCK_DIR="$HOME/.hermes/kanban"
-# NEW-H3 fix: mkdir -m은 기존 디렉토리 권한을 변경하지 않으므로 명시적 chmod
-mkdir -p "$LOCK_DIR"
-chmod 700 "$LOCK_DIR" 2>/dev/null || true
-LOCK_FILE="$LOCK_DIR/.backup.lock"
-exec 9>"$LOCK_FILE"
-if ! flock -n 9; then
-    # R3-NF5 fix: silent skip 누적 검출 — skip 카운터 파일
-    SKIP_COUNTER="$LOCK_DIR/.backup.skip_counter"
-    SKIPS=$(cat "$SKIP_COUNTER" 2>/dev/null || echo 0)
-    SKIPS=$((SKIPS + 1))
-    echo "$SKIPS" > "$SKIP_COUNTER"
-    if [ "$SKIPS" -ge 3 ]; then
-        echo "FAIL: backup_kanban_db.sh skipped $SKIPS times in a row (lock contention persistent)" >&2
-        # notify_alert이 있으면 발사 (silent on missing)
-        SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-        [ -x "$SCRIPT_DIR/notify_alert.sh" ] && \
-            "$SCRIPT_DIR/notify_alert.sh" kanban_db_recovery_required \
-                "backup_kanban_db.sh skipped $SKIPS times (lock contention)" warn >/dev/null 2>&1 || true
-        exit 4
-    fi
-    echo "INFO: another backup_kanban_db.sh instance is running, skipping (skips=$SKIPS)" >&2
-    if [ "${HERMES_BACKUP_FAIL_ON_LOCK:-0}" = "1" ]; then
-        echo "FAIL: backup lock contention during required pre-cycle backup" >&2
-        exit 4
-    fi
-    exit 0
-fi
-# 정상 backup이 시작되면 skip 카운터 reset
-rm -f "$LOCK_DIR/.backup.skip_counter" 2>/dev/null || true
-
 # 인자 파싱
 LABEL_RAW="${1:-auto_$(date -u +%Y%m%dT%H%M%SZ)}"
 BOARD_OVERRIDE="${2:-}"
@@ -81,8 +48,76 @@ else
     fi
 fi
 
-SRC="$KANBAN_ROOT/boards/$BOARD/kanban.db"
-DEST_DIR="$KANBAN_ROOT/backups"
+BOARD_DIR="$KANBAN_ROOT/boards/$BOARD"
+SRC="$BOARD_DIR/kanban.db"
+
+ensure_writable_dir() {
+    local primary="$1"
+    local fallback="$2"
+    local purpose="$3"
+    local probe
+
+    mkdir -p "$primary" 2>/dev/null || true
+    chmod 700 "$primary" 2>/dev/null || true
+    probe="$primary/.write_probe_$$"
+    if (: > "$probe") 2>/dev/null; then
+        rm -f "$probe" 2>/dev/null || true
+        echo "$primary"
+        return 0
+    fi
+
+    mkdir -p "$fallback"
+    chmod 700 "$fallback" 2>/dev/null || true
+    probe="$fallback/.write_probe_$$"
+    if (: > "$probe") 2>/dev/null; then
+        rm -f "$probe" 2>/dev/null || true
+        echo "WARN: $purpose primary dir not writable; using fallback: $fallback" >&2
+        echo "$fallback"
+        return 0
+    fi
+
+    echo "FAIL: neither primary nor fallback $purpose dir is writable: $primary / $fallback" >&2
+    exit 1
+}
+
+if [ ! -d "$BOARD_DIR" ]; then
+    echo "FAIL: board directory not found at $BOARD_DIR" >&2
+    exit 1
+fi
+
+# flock 단일 instance 보장 (T2-14 + R4-NF5: 사용자별 격리)
+# R4-NF5 fix: /tmp 공유 lock은 multi-user 환경에서 DoS 가능 → user home으로 이동
+# Sandbox recovery: if ~/.hermes/kanban is mounted read-only, keep the lock under
+# the active board directory so required preflight backups still run.
+LOCK_DIR=$(ensure_writable_dir "$KANBAN_ROOT" "$BOARD_DIR/.backup_state" "backup lock")
+LOCK_FILE="$LOCK_DIR/.backup.lock"
+exec 9>"$LOCK_FILE"
+if ! flock -n 9; then
+    # R3-NF5 fix: silent skip 누적 검출 — skip 카운터 파일
+    SKIP_COUNTER="$LOCK_DIR/.backup.skip_counter"
+    SKIPS=$(cat "$SKIP_COUNTER" 2>/dev/null || echo 0)
+    SKIPS=$((SKIPS + 1))
+    echo "$SKIPS" > "$SKIP_COUNTER"
+    if [ "$SKIPS" -ge 3 ]; then
+        echo "FAIL: backup_kanban_db.sh skipped $SKIPS times in a row (lock contention persistent)" >&2
+        # notify_alert이 있으면 발사 (silent on missing)
+        SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+        [ -x "$SCRIPT_DIR/notify_alert.sh" ] && \
+            "$SCRIPT_DIR/notify_alert.sh" kanban_db_recovery_required \
+                "backup_kanban_db.sh skipped $SKIPS times (lock contention)" warn >/dev/null 2>&1 || true
+        exit 4
+    fi
+    echo "INFO: another backup_kanban_db.sh instance is running, skipping (skips=$SKIPS)" >&2
+    if [ "${HERMES_BACKUP_FAIL_ON_LOCK:-0}" = "1" ]; then
+        echo "FAIL: backup lock contention during required pre-cycle backup" >&2
+        exit 4
+    fi
+    exit 0
+fi
+# 정상 backup이 시작되면 skip 카운터 reset
+rm -f "$LOCK_DIR/.backup.skip_counter" 2>/dev/null || true
+
+DEST_DIR=$(ensure_writable_dir "$KANBAN_ROOT/backups" "$BOARD_DIR/backups" "backup destination")
 DEST="$DEST_DIR/${LABEL}.db"
 
 # T1-07 + R4-F2: realpath prefix 확인 (DEST가 DEST_DIR 안에 있는지)

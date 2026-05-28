@@ -212,7 +212,40 @@ stages:
       - "v1 (2026-05-28 Stage 1): wired_v1 — evaluator helper + tests + train_transformer 사전 검증"
     _wire_up_remaining_for_full_chain:
       - "SYNTH worker prompt에 cycle_report.json 표준 schema + auto_continue_check 호출 의무 명시 (M2 SYNTH 첫 실행 시 적용)"
-      - "evaluate.py main()에서 mid_multitask stage 진입 시 fairness_gate_per_rubric 호출 branch 추가 (현재는 helper만 export, main 분기는 cycle_report 산출 시점 적용)"
+      - "evaluate.py main()에서 mid_multitask stage 진입 시 fairness_gate_per_rubric 호출 branch 추가. helper-only dead code 또는 overall-only fairness_gate() main path는 EVAL acceptance hard-block."
+    implementation_gates:
+      m5_m6_multitask_only:
+        operator: "=="
+        value: true
+        hard_block: true
+        required_targets: ["target_exp", "target_org", "target_cont", "target_overall_norm"]
+        forbidden_paths:
+          - "m5_single_target_regression"
+          - "m5_hpo_scalar_fallback"
+          - "pipelines/train_transformer.py num_labels=1 scalar path for Phase 3 M5/M6"
+        failure_judgement: FAIL_CHANGE_MODEL
+        note: "Hard Rule #15 — M5/M6 Phase 3 must be multi-task only; scalar M5/HPO fallback is forbidden."
+      eval_per_rubric_fairness_executable:
+        operator: "calls"
+        value: "fairness_gate_per_rubric"
+        hard_block: true
+        forbidden_paths:
+          - "helper_only_dead_code"
+          - "overall_only_fairness_gate_main"
+        failure_judgement: FAIL_REVIEW_LABELS
+        note: "Hard Rule #14/#15 — EVAL executable path must call Phase 3 per-rubric fairness logic, not helper-only dead code."
+      long_running_task_metadata:
+        operator: "contains"
+        value: "expected_duration_min > 10"
+        hard_block: true
+        applies_to_tasks:
+          - "T-CYCLE-MN-MODEL"
+          - "T-CYCLE-MN-HPO"
+        also_requires:
+          - "off-worker detach instructions"
+          - "one-shot polling task instructions"
+        failure_judgement: FAIL_RETRY_HPO
+        note: "Hard Rule #16 — long-running MODEL/HPO task bodies must include literal `expected_duration_min > 10` plus off-worker/polling instructions."
     scope:
       dataset: "dataset/sample_5k/ (Phase 2 inheritance — D4)"
       max_rows: 5003
@@ -361,7 +394,30 @@ stages:
         value: 300
         hard_block: true
         failure_judgement: FAIL_REBUILD_FEATURES
-        note: "Hard Rule SPLIT — k=5 inheritance"
+        note: "Hard Rule SPLIT — default student.location + k=5. M2 approved fallback region merge + k=3 may be used only after default split valid_n hard-block evidence."
+      default_split:
+        group_key: "student.location"
+        k: 5
+        min_valid_n: 300
+        required_first_attempt: true
+      approved_fallback:
+        name: "region merge + k=3"
+        allowed_cycles: ["M2"]
+        trigger: "any default student.location + k=5 fold violates valid_n >= 300"
+        group_key: "region"
+        k: 3
+        min_valid_n: 300
+        hard_block: true
+        requirements:
+          group_overlap_count: 0
+          student_location_overlap_count_all_folds: 0
+          student_location_model_input: false
+          min_valid_n: ">= 300"
+        evidence_required:
+          - "failed default split report"
+          - "accepted fallback split manifest"
+        failure_judgement: FAIL_REBUILD_FEATURES
+        note: "M2R POLICY v3 — fallback preserves leakage controls and min_valid_n; it changes only group granularity and k."
     ceiling_comparison:
       metric_unit: "QWK(model_pred, 3-rater-average)"
       bootstrap_ci_required: true

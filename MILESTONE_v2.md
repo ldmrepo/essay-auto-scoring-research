@@ -6,7 +6,7 @@
 > - **종료 사유**: 단일 타겟(`essay_scoreT_avg`) 학습 설계가 사용자 실제 목적(루브릭별 차원 점수)과 불일치. 데이터셋의 다차원 채점(표현/구성/내용 × 채점자 3명 × 소분류 9~11개) 정보 활용 부족
 > - **보존 산출**: `workspace/cycle_M1/{audit,splits,features,models/M{1,2,3,4}}/` (재현 가능)
 > - **archive 처리**: t_13e1eaaa (HPO), t_1bab6d23 (EVAL), t_785a48e3 (REVIEW), t_171d099a (SYNTH), t_617de071 (DECIDE-M1)
-> - **Phase 3 진입 대기**: multi-task 모델 설계 (`docs/multi_task_채점모델_구현_스펙_v_1_0.md`) 기준으로 새 milestone 작성 예정
+> - **Phase 3 진입 대기**: multi-task 모델 설계 (`docs/archive/superseded/multi_task_채점모델_구현_스펙_v_1_0.md`) 기준으로 새 milestone 작성 예정
 >
 > Hard Rule #10 source — Cycle MN의 AUDIT sub-task body에 verbatim 재주입되는 goal anchor.
 > 본 문서는 변경 시 AGENTS.md LOCKED 변경과 동일한 인간 게이트 필요.
@@ -52,6 +52,6 @@ DECIDE-MN [Continue] 1클릭으로 Cycle M(N+1) 자동 시작.
 ## References
 
 - AGENTS.md v4 — Hard Rules + 9-step Cycle Pattern + When HPO
-- docs/phase_2_mid_scale_design_v_1_1.md — 인프라/리스크/일정 상세
+- docs/archive/phase2/phase_2_mid_scale_design_v_1_1.md — 인프라/리스크/일정 상세
 - VAST_GPU_GUIDE.md — vast.ai 원격 GPU 작업 절차
 - dataset/sample_5k/manifest.json — 본 milestone primary 데이터셋 spec

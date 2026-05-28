@@ -91,6 +91,27 @@ except Exception:
 PY
 }
 
+file_channel_target() {
+    python3 - "$REPO_ROOT/configs/board_config.yaml" <<'PY'
+import os
+import sys
+
+default = os.path.expanduser("~/.hermes/kanban/alerts/alerts.log")
+try:
+    import yaml
+
+    with open(sys.argv[1], encoding="utf-8") as f:
+        data = yaml.safe_load(f) or {}
+    for channel in (data.get("notify_channels") or {}).get("channels") or []:
+        if channel.get("kind") == "file":
+            print(os.path.expanduser(str(channel.get("target") or default)))
+            raise SystemExit
+    print(default)
+except Exception:
+    print(default)
+PY
+}
+
 load_env_key PHASE3_WEBHOOK_URL
 load_env_key PHASE3_ALERT_EMAIL
 
@@ -122,9 +143,20 @@ TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 HOSTNAME=$(hostname -s 2>/dev/null || echo "unknown")
 FULL_MSG="[$SEVERITY][$HOSTNAME][$TS] $TRIGGER: $MESSAGE"
 
-LOG_DIR="$HOME/.hermes/kanban/alerts"
-mkdir -p -m 700 "$LOG_DIR"
-LOG_FILE="$LOG_DIR/alerts.log"
+LOG_FILE=$(file_channel_target)
+LOG_DIR=$(dirname "$LOG_FILE")
+mkdir -p -m 700 "$LOG_DIR" 2>/dev/null || true
+if ! (: >> "$LOG_FILE") 2>/dev/null; then
+    PRIMARY_LOG_FILE="$LOG_FILE"
+    LOG_FILE="$REPO_ROOT/workspace/alerts/alerts.log"
+    LOG_DIR=$(dirname "$LOG_FILE")
+    mkdir -p -m 700 "$LOG_DIR"
+    if (: >> "$LOG_FILE") 2>/dev/null; then
+        echo "  warn: primary file-log unavailable ($PRIMARY_LOG_FILE), using fallback ($LOG_FILE)" >&2
+    else
+        LOG_FILE="$PRIMARY_LOG_FILE"
+    fi
+fi
 LOG_COUNT=0
 PUSH_COUNT=0
 CONFIGURED_PUSH_COUNT=0

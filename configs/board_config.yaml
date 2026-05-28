@@ -1,5 +1,6 @@
 # Self-improving cycle board configuration
-# Source: docs/self_improving_architecture_v_1_0.md + docs/escalation_matrix_v_1_0.md
+# Source: docs/archive/background/self_improving_architecture_v_1_0.md
+#         + docs/archive/background/escalation_matrix_v_1_0.md
 #         + docs/research/self_improving_long_running_research_v_1_0.md
 # Applied decisions:
 #   D1. decide_timeout_policy = 3-tier 분기 (cycle 내부 Continue / DECIDE 6h grace → Pause / Phase 전환 Pause)
@@ -37,7 +38,7 @@ auto_cycle:
     on_breach: "pause_and_notify"       # halt cycle + human alert task auto-create
 
   # DECIDE task template reference
-  decide_task_template: "docs/self_improving_architecture_v_1_0.md#decide-n-task-pattern"
+  decide_task_template: "docs/archive/background/self_improving_architecture_v_1_0.md#decide-n-task-pattern"
 
   # Goal anchor refresh (외부 리서치 P1 권고)
   # 매 cycle 첫 sub-task(AUDIT)에 원본 milestone goal verbatim 재주입

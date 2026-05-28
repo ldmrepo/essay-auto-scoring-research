@@ -389,6 +389,22 @@ def manifest(
     row_manifest_paths: list[str],
 ) -> dict[str, Any]:
     group_column = selected_group_column(args.group_key)
+    verification_parts = [
+        "python3",
+        "pipelines/make_splits.py",
+        f"--input {args.input}",
+        f"--k {args.k}",
+        f"--output {args.output}",
+        f"--cycle-id {args.cycle_id}",
+        f"--kanban-task-id {args.kanban_task_id}",
+        f"--min-valid-n {args.min_valid_n}",
+        f"--group-key {args.group_key}",
+    ]
+    if args.audit_table:
+        verification_parts.append(f"--audit-table {args.audit_table}")
+    if args.region_map:
+        verification_parts.append(f"--region-map {args.region_map}")
+
     config_payload = {
         "cycle_id": args.cycle_id,
         "kanban_task_id": args.kanban_task_id,
@@ -503,6 +519,31 @@ def manifest(
                 f"fold_{fold} score_band {band} deviates "
                 f"{deviation['abs_deviation_percentage_points']:.2f}pp from overall > 10.00pp"
             )
+    fallback_verification_parts = [
+        "python3",
+        "pipelines/make_splits.py",
+        f"--input {args.input}",
+        "--k 3",
+        f"--output {args.output}_region_k3_candidate",
+        f"--cycle-id {args.cycle_id}",
+        f"--kanban-task-id {args.kanban_task_id}",
+        f"--min-valid-n {args.min_valid_n}",
+        "--group-key region",
+    ]
+    if args.audit_table:
+        fallback_verification_parts.append(f"--audit-table {args.audit_table}")
+
+    fallback_decision = {
+        "status": "not_applied",
+        "reason": (
+            "Default k=5 student.location split failed the valid_n safety gate. "
+            "Fallback requires explicit policy/acceptance update before use."
+            if hard_blocks
+            else "Default k=5 student.location split passed; fallback not needed."
+        ),
+        "recommended_fallback": "region merge + k=3",
+        "recommended_verification_command": " ".join(fallback_verification_parts),
+    }
 
     return {
         "cycle_id": args.cycle_id,
@@ -562,6 +603,7 @@ def manifest(
             "target_score_usage": "coarse score_band stratification only; target values are not written to row-level split artifacts",
             "student_location_policy": "split-only; excluded from model feature artifacts",
         },
+        "fallback_decision": fallback_decision,
         "verdict": "HARD_BLOCK" if hard_blocks else "PASS",
         "hard_blocks": hard_blocks,
         "warnings": warnings,
@@ -571,12 +613,7 @@ def manifest(
             "split_manifest": str(output_dir / "split_manifest.yaml"),
             "split_leakage_check": str(output_dir / "split_leakage_check.md"),
         },
-        "verification_command": (
-            f"python3 pipelines/make_splits.py --input {args.input} --k {args.k} "
-            f"--output {args.output} --cycle-id {args.cycle_id} "
-            f"--kanban-task-id {args.kanban_task_id} --min-valid-n {args.min_valid_n} "
-            f"--group-key {args.group_key}"
-        ),
+        "verification_command": " ".join(verification_parts),
     }
 
 
@@ -664,6 +701,15 @@ Acceptance check, absolute fold deviation from overall distribution:
 ## Hard Blocks
 {hard_block_lines}
 - Rationale: this Phase 2 split requires every fold to satisfy `valid_n >= {manifest_doc['min_valid_n']}`.
+
+## Fallback Decision
+- Status: `{manifest_doc['fallback_decision']['status']}`
+- Reason: {manifest_doc['fallback_decision']['reason']}
+- Recommended fallback: `{manifest_doc['fallback_decision']['recommended_fallback']}`
+- Candidate verification command:
+```bash
+{manifest_doc['fallback_decision']['recommended_verification_command']}
+```
 
 ## Reproducibility
 - Split hash: `{manifest_doc['split_hash']}`

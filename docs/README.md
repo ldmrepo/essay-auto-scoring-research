@@ -1,49 +1,40 @@
 # Docs Index
 
-이 디렉터리는 운영 중인 Phase 2 문서와 Phase 1 evidence만 보존합니다. 발표 원고, 생성 이미지 프롬프트, 완료된 구현 계획, 중복 task spec은 제거했습니다.
+이 디렉터리는 Phase 3 운영에 필요한 active 문서만 루트에 두고, 완료된 발표/리뷰/구버전/배경 문서는 `archive/` 아래에 보존합니다.
 
-## Active Phase 2
+## Active Phase 3
 
 | 문서 | 용도 |
 |---|---|
-| `phase_2_mid_scale_design_v_1_1.md` | Phase 2 운영 설계, 현재 상태, 리스크, Cycle M1 체인 |
-| `cycle_task_chain_v_1_1.md` | Hermes cycle/DECIDE 체인 운영 규칙 |
-| `self_improving_architecture_v_1_0.md` | 자가발전 architecture와 인간 게이트 경계 |
-| `escalation_matrix_v_1_0.md` | 실패/차단/리소스 초과 대응 |
-| `mlflow_기반_ai_서술형_자동채점_실험추적_리포트_가이드_v_1_0.md` | MLflow 운영 가이드 |
+| `multi_task_채점모델_구현_스펙_v_1_1.md` | Phase 3 multi-task 모델 구현 기준 |
+| `phase_3_operations_guide_v_1_0.md` | Phase 3 운영, recovery, polling, backup 절차 |
+| `dataset_채점방식_분석_v_1_0.md` | AI Hub 채점 구조와 rubric 분석 |
+| `mlflow_기반_ai_서술형_자동채점_실험추적_리포트_가이드_v_1_0.md` | MLflow 실험 추적 기준 |
 
 ## Research Evidence
 
 | 문서 | 용도 |
 |---|---|
 | `research/vast_ai_essay_workflow_v_1_0.md` | Vast.ai 원격 GPU 운영 근거 |
-| `research/self_improving_long_running_research_v_1_0.md` | Voyager, AutoGPT, Devin 등 외부 사례 |
+| `research/self_improving_long_running_research_v_1_0.md` | 자가발전 agent 사례 리서치 |
 | `research/mlflow_tracing_2026_research_v_1_0.md` | MLflow Tracing와 LLM Judge 도입 검토 |
 
-## Phase 1 Evidence
+## Archive
 
-| 문서 | 용도 |
+| 위치 | 내용 |
 |---|---|
-| `final_report_v_1_0.md` | Phase 1 toy final report |
-| `hermes_validation_v_1_0.md` | Hermes workflow validation |
-| `hermes_kanban_토이_검증_파이프라인_구조_v_1_0.md` | Phase 1 pipeline execution record |
-
-## Background References
-
-다음 문서는 운영 기준이 아니라 배경 리서치/설계 참고입니다.
-
-| 문서 | 용도 |
-|---|---|
-| `hermes_핵심구조_kanban_multi_agent_board_개념_사용_활용_정리_v_1_0.md` | Hermes Kanban 개념 정리 |
-| `hermes_kanban_multi_agent_board_최신_리서치_및_심층이해_v_1_0.md` | Hermes Kanban 심층 리서치 |
-| `hermes_kanban_claude_code_max_codex_pro_팀구성_운영방안_v_1_0.md` | multi-agent 운영안 |
-| `hermes_kanban_기반_ai_서술형_자동채점_연구팀_오버뷰_v_1_0.md` | 연구팀 구성 오버뷰 |
-| `hermes_kanban_기반_ai_서술형_자동채점_연구팀_풀셋_구성_v_1_0.md` | 확장형 연구팀 구성안 |
+| `archive/phase1/` | Phase 1 toy final report, validation, pipeline 기록 |
+| `archive/phase2/` | Phase 2 설계와 원격 GPU 복구 기록 |
+| `archive/background/` | Hermes 개념, 팀 구성, 보조 설명 문서 |
+| `archive/progress/` | Phase 3 작업계획, 리뷰 체크리스트, 진행성 검수 문서 |
+| `archive/seminar/` | 세미나 원고, 이미지 프롬프트, PPT 산출물 |
+| `archive/superseded/` | 최신본으로 대체된 구버전 스펙 |
 
 ## Current Source Of Truth
 
 - Project rules: `../AGENTS.md`
-- Phase 2 goal anchor: `../MILESTONE_v2.md`
-- Current board: `essay-auto-scoring-research-phase2`
+- Phase 3 goal anchor: `../MILESTONE_v3.md`
+- Acceptance gates: `../ACCEPTANCE_CRITERIA.yaml`
+- Current board: `essay-auto-scoring-research-phase3`
 - Current data: `../dataset/sample_5k/`
 - Vast.ai procedure: `../VAST_GPU_GUIDE.md`
