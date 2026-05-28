@@ -12,6 +12,8 @@ import mlflow
 import pytest
 
 from pipelines.run_hpo import (
+    build_m4_objective_factory,
+    build_m5_objective_factory,
     enforce_min_trials,
     parse_args,
     run_with_mlflow_parent,
@@ -121,6 +123,43 @@ def _quadratic_objective_factory(trial_counter: dict[str, int]):
         return (x - 3.0) ** 2
 
     return objective
+
+
+class TestObjectiveFactoryImports:
+    """Regression: factory invocation must not ImportError from pipelines.train.
+
+    Prior bug: build_m4/m5_objective_factory referenced load_features / load_labels /
+    train_lightgbm_single_fold which do not exist in pipelines.train. Tests only
+    exercised the wrapper, so the bug surfaced at runtime in HPO.
+    """
+
+    def test_m4_factory_invocation_no_importerror(self, tmp_path):
+        feature_dir = tmp_path / "features"
+        feature_dir.mkdir()
+        factory = build_m4_objective_factory(
+            feature_dir=feature_dir,
+            label_dir=tmp_path / "labels",
+            seed=42,
+        )
+        # Calling the factory must resolve all imports from pipelines.train.
+        # An empty feature_dir → discover_folds raises FileNotFoundError, which is
+        # acceptable; what we forbid is ImportError on load_features / load_labels /
+        # train_lightgbm_single_fold (the prior bug).
+        with pytest.raises(FileNotFoundError):
+            factory()
+
+    def test_m5_factory_invocation_no_importerror(self, tmp_path):
+        feature_dir = tmp_path / "features"
+        feature_dir.mkdir()
+        factory = build_m5_objective_factory(
+            feature_dir=feature_dir,
+            label_dir=tmp_path / "labels",
+            hf_model="klue/roberta-small",
+            seed=42,
+            output_root=tmp_path / "trials",
+        )
+        with pytest.raises(FileNotFoundError):
+            factory()
 
 
 class TestRunWithMlflowParent:

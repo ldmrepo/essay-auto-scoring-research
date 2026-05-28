@@ -13,6 +13,7 @@ import hashlib
 import importlib.metadata
 import json
 import math
+import re
 import sys
 import time
 from datetime import datetime, timezone
@@ -35,6 +36,7 @@ from sklearn.preprocessing import StandardScaler
 TARGET_NAME = "essay_scoreT_avg"
 SCORE_MIN = 0
 SCORE_MAX = 30
+SENTENCE_SEPARATOR = "#@문장구분#"
 MODEL_SPECS: dict[str, dict[str, Any]] = {
     "M1": {
         "model_name": "dummy_mean",
@@ -125,10 +127,21 @@ def parse_args() -> argparse.Namespace:
         "--models",
         nargs="+",
         default=["M1", "M2", "M3", "M4"],
-        choices=sorted(MODEL_SPECS),
-        help="Subset of model IDs to train.",
+        help="Subset of model IDs to train. Accepts space-separated or comma-separated IDs.",
     )
     return parser.parse_args()
+
+
+def normalize_model_ids(model_args: list[str]) -> list[str]:
+    model_ids: list[str] = []
+    for token in model_args:
+        model_ids.extend(part.strip() for part in token.split(",") if part.strip())
+    unknown = sorted(set(model_ids) - set(MODEL_SPECS))
+    if unknown:
+        raise ValueError(f"unknown model ids: {unknown}; valid={sorted(MODEL_SPECS)}")
+    if not model_ids:
+        raise ValueError("at least one model id is required")
+    return model_ids
 
 
 def sha256_file(path: Path) -> str:
@@ -146,6 +159,20 @@ def sha256_text(text: str) -> str:
 def load_json(path: Path) -> Any:
     with path.open("r", encoding="utf-8") as handle:
         return json.load(handle)
+
+
+def discover_folds(feature_dir: Path) -> list[int]:
+    folds = []
+    for path in feature_dir.glob("fold_*_row_manifest.json"):
+        parts = path.stem.split("_")
+        if len(parts) >= 3 and parts[0] == "fold" and parts[1].isdigit():
+            folds.append(int(parts[1]))
+    if not folds:
+        raise FileNotFoundError(f"no fold_*_row_manifest.json files under {feature_dir}")
+    missing = sorted(set(range(max(folds) + 1)) - set(folds))
+    if missing:
+        raise ValueError(f"non-contiguous fold manifests under {feature_dir}: missing {missing}")
+    return sorted(folds)
 
 
 def write_json(path: Path, payload: Any) -> None:
@@ -254,6 +281,45 @@ def load_label(label_dir: Path, relative_path: str, essay_id: str) -> dict[str, 
     }
 
 
+def extract_model_text(doc: dict[str, Any], path: Path) -> tuple[str, str]:
+    """Return only model-visible essay text from supported source/label layouts."""
+    essay_id = doc.get("essay_id")
+    raw_text = doc.get("essay_txt")
+    if isinstance(essay_id, str) and isinstance(raw_text, str) and raw_text.strip():
+        return essay_id, raw_text
+
+    info = doc.get("info") if isinstance(doc.get("info"), dict) else {}
+    essay_id = info.get("essay_id")
+    paragraph = doc.get("paragraph", [])
+    paragraph_texts = [
+        item.get("paragraph_txt", "")
+        for item in paragraph
+        if isinstance(item, dict) and isinstance(item.get("paragraph_txt"), str)
+    ] if isinstance(paragraph, list) else []
+    raw_text = "\n".join(paragraph_texts)
+    if isinstance(essay_id, str) and raw_text.strip():
+        return essay_id, raw_text
+
+    raise ValueError(f"missing model-visible essay text in {path}")
+
+
+def normalize_text(raw_text: str) -> str:
+    text = raw_text.replace(SENTENCE_SEPARATOR, " ")
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
+
+
+def load_model_text(label_dir: Path, relative_path: str, essay_id: str) -> str:
+    label_path = label_dir / relative_path
+    doc = load_json(label_path)
+    source_essay_id, raw_text = extract_model_text(doc, label_path)
+    if source_essay_id != essay_id:
+        raise ValueError(
+            f"essay_id mismatch for {relative_path}: manifest={essay_id} source={source_essay_id}"
+        )
+    return normalize_text(raw_text)
+
+
 def load_fold_data(
     fold: int, feature_dir: Path, label_dir: Path
 ) -> tuple[sparse.csr_matrix, pd.DataFrame, dict[str, Any]]:
@@ -291,7 +357,9 @@ def select_features(
     raise ValueError(f"unknown model_id: {model_id}")
 
 
-def build_estimator(model_id: str, seed: int) -> Any:
+def build_estimator(
+    model_id: str, seed: int, hparams: dict[str, Any] | None = None
+) -> Any:
     spec = MODEL_SPECS[model_id]
     if model_id == "M1":
         return DummyRegressor(strategy="mean")
@@ -301,7 +369,10 @@ def build_estimator(model_id: str, seed: int) -> Any:
             RidgeCV(alphas=spec["alphas"], scoring="neg_mean_absolute_error", cv=3),
         )
     if model_id == "M4":
-        return LGBMRegressor(random_state=seed, **spec["params"])
+        params = dict(spec["params"])
+        if hparams:
+            params.update(hparams)
+        return LGBMRegressor(random_state=seed, **params)
     raise ValueError(f"unknown model_id: {model_id}")
 
 
@@ -354,7 +425,7 @@ def mlflow_log_common(
                 "cycle_id": str(args.cycle_id),
                 "kanban_task_id": args.kanban_task_id,
                 "feature_provenance": feature_provenance_hash,
-                "dataset_version": "dataset/sample",
+                "dataset_version": str(Path(args.label_dir).parent),
                 "split_version": split_hash,
                 "rubric_version": "label_json_embedded_rubrics_not_model_inputs",
                 "fold": str(fold),
@@ -398,6 +469,7 @@ def train_model(
     config_hash: str,
     split_hash: str,
     feature_provenance_hash: str,
+    folds: list[int],
 ) -> dict[str, Any]:
     model_dir = output_dir / model_id
     model_dir.mkdir(parents=True, exist_ok=True)
@@ -405,7 +477,7 @@ def train_model(
     all_valid_predictions: list[pd.DataFrame] = []
     run_ids: dict[str, str] = {}
 
-    for fold in range(5):
+    for fold in folds:
         matrix, labels, row_manifest = load_fold_data(
             fold=fold, feature_dir=Path(args.feature_dir), label_dir=Path(args.label_dir)
         )
@@ -435,7 +507,7 @@ def train_model(
         warnings = []
         if gap_abs > 0.10:
             warnings.append(
-                "train_valid_qwk_gap_abs_gt_0.10_warn_only_toy_phase"
+                "train_valid_qwk_gap_abs_gt_0.10"
             )
 
         valid_predictions = labels.loc[valid_mask].copy()
@@ -543,6 +615,9 @@ def train_model(
         "split_manifest_sha256": split_hash,
         "mlflow_experiment": args.experiment_name,
         "mlflow_run_ids": run_ids,
+        "folds": folds,
+        "fold_count": len(folds),
+        "valid_prediction_count": int(len(predictions)),
         "overall_valid_metrics": overall_metrics,
         "artifact_paths": {
             "predictions": str(predictions_path),
@@ -564,7 +639,231 @@ def train_model(
             f"python3 -c \"import json, pandas as pd; "
             f"m=json.load(open('{manifest_path}')); "
             f"p=pd.read_csv('{predictions_path}'); "
-            f"assert len(m['mlflow_run_ids']) == 5 and len(p) == 342\""
+            f"assert len(m['mlflow_run_ids']) == m['fold_count']; "
+            f"assert len(p) == m['valid_prediction_count']\""
+        ),
+    }
+    write_json(manifest_path, manifest)
+    return manifest
+
+
+def train_transformer_model(
+    model_id: str,
+    args: argparse.Namespace,
+    output_dir: Path,
+    config_hash: str,
+    split_hash: str,
+    feature_provenance_hash: str,
+    folds: list[int],
+) -> dict[str, Any]:
+    if model_id != "M5":
+        raise ValueError(f"train_transformer_model only supports M5, got {model_id}")
+    if not args.model:
+        raise ValueError("--model is required when training M5")
+
+    from pipelines.train_transformer import train_transformer
+
+    model_dir = output_dir / model_id
+    model_dir.mkdir(parents=True, exist_ok=True)
+    per_fold_metrics: list[dict[str, Any]] = []
+    all_valid_predictions: list[pd.DataFrame] = []
+    run_ids: dict[str, str] = {}
+    hparams = dict(MODEL_SPECS[model_id]["default_hparams"])
+
+    for fold in folds:
+        _, labels, _ = load_fold_data(
+            fold=fold, feature_dir=Path(args.feature_dir), label_dir=Path(args.label_dir)
+        )
+        labels["text"] = [
+            load_model_text(Path(args.label_dir), row.relative_path, row.essay_id)
+            for row in labels.itertuples(index=False)
+        ]
+
+        train_mask = labels["partition"] == "train"
+        valid_mask = labels["partition"] == "valid"
+        train_df = labels.loc[train_mask, ["text", TARGET_NAME]].rename(
+            columns={TARGET_NAME: "score"}
+        )
+        valid_df = labels.loc[valid_mask, ["text", TARGET_NAME]].rename(
+            columns={TARGET_NAME: "score"}
+        )
+        y_train = train_df["score"].to_numpy(dtype=float)
+        y_valid = valid_df["score"].to_numpy(dtype=float)
+
+        fold_output_dir = model_dir / f"fold_{fold}_trainer"
+        start = time.perf_counter()
+        transformer_result = train_transformer(
+            train_df=train_df,
+            valid_df=valid_df,
+            hparams=hparams,
+            output_dir=str(fold_output_dir),
+            text_col="text",
+            label_col="score",
+            model_name=args.model,
+            tokenizer_name=args.model,
+            max_length=256,
+            seed=args.seed,
+        )
+        train_time_seconds = float(time.perf_counter() - start)
+        train_pred = np.asarray(transformer_result["train_predictions"], dtype=float)
+        valid_pred = np.asarray(transformer_result["valid_predictions"], dtype=float)
+
+        train_metrics = regression_metrics(y_train, train_pred)
+        valid_metrics = regression_metrics(y_valid, valid_pred)
+        gap_abs = abs(train_metrics["qwk"] - valid_metrics["qwk"])
+        warnings = []
+        if gap_abs > 0.10:
+            warnings.append("train_valid_qwk_gap_abs_gt_0.10")
+
+        valid_predictions = labels.loc[valid_mask].copy()
+        valid_predictions.insert(0, "fold", fold)
+        valid_predictions.insert(0, "model_id", model_id)
+        valid_predictions["prediction"] = np.clip(valid_pred, SCORE_MIN, SCORE_MAX)
+        valid_predictions["prediction_rounded"] = rounded_score(
+            valid_predictions["prediction"].to_numpy(dtype=float)
+        )
+        valid_predictions["mlflow_run_id"] = ""
+        valid_predictions = valid_predictions[
+            [
+                "model_id",
+                "fold",
+                "essay_id",
+                "relative_path",
+                "partition",
+                TARGET_NAME,
+                "prediction",
+                "prediction_rounded",
+                "essay_type",
+                "student_grade_group",
+                "score_band",
+                "mlflow_run_id",
+            ]
+        ]
+
+        fold_predictions_path = model_dir / f"fold_{fold}_predictions.csv"
+        fold_metrics_path = model_dir / f"fold_{fold}_metrics.json"
+        fold_segment_path = model_dir / f"fold_{fold}_segment_metrics.csv"
+        fold_run_path = model_dir / f"M5_run_fold_{fold}.json"
+        valid_predictions.to_csv(fold_predictions_path, index=False)
+        segment_metrics(valid_predictions).to_csv(fold_segment_path, index=False)
+
+        fold_metrics = {
+            "model_id": model_id,
+            "model_name": MODEL_SPECS[model_id]["model_name"],
+            "hf_model": args.model,
+            "fold": fold,
+            "train_n": int(train_mask.sum()),
+            "valid_n": int(valid_mask.sum()),
+            "feature_set": MODEL_SPECS[model_id]["feature_set"],
+            "assumption": MODEL_SPECS[model_id]["assumption"],
+            "hparams": hparams,
+            "train_time_seconds": train_time_seconds,
+            "train_metrics": train_metrics,
+            "valid_metrics": valid_metrics,
+            "train_valid_qwk_gap": train_metrics["qwk"] - valid_metrics["qwk"],
+            "train_valid_qwk_gap_abs": gap_abs,
+            "prediction_distribution": {
+                "train_mean": float(np.mean(train_pred)),
+                "train_std": float(np.std(train_pred)),
+                "valid_mean": float(np.mean(valid_pred)),
+                "valid_std": float(np.std(valid_pred)),
+                "valid_min": float(np.min(valid_pred)),
+                "valid_max": float(np.max(valid_pred)),
+            },
+            "model_path": transformer_result["model_path"],
+            "warnings": warnings,
+        }
+        write_json(fold_metrics_path, fold_metrics)
+
+        run_id = mlflow_log_common(
+            model_id=model_id,
+            fold=fold,
+            args=args,
+            config_hash=config_hash,
+            split_hash=split_hash,
+            feature_provenance_hash=feature_provenance_hash,
+            train_metrics=train_metrics,
+            valid_metrics=valid_metrics,
+            train_time_seconds=train_time_seconds,
+            feature_set=MODEL_SPECS[model_id]["feature_set"],
+            artifact_paths=[fold_predictions_path, fold_metrics_path, fold_segment_path],
+            estimator_extra_params={"hf_model": args.model, **hparams},
+        )
+        run_ids[str(fold)] = run_id
+        valid_predictions["mlflow_run_id"] = run_id
+        valid_predictions.to_csv(fold_predictions_path, index=False)
+        fold_metrics["mlflow_run_id"] = run_id
+        write_json(fold_metrics_path, fold_metrics)
+        write_json(
+            fold_run_path,
+            {
+                "model_id": model_id,
+                "fold": fold,
+                "mlflow_run_id": run_id,
+                "metrics_path": str(fold_metrics_path),
+                "predictions_path": str(fold_predictions_path),
+                "model_path": transformer_result["model_path"],
+            },
+        )
+        all_valid_predictions.append(valid_predictions)
+        per_fold_metrics.append(fold_metrics)
+
+    predictions = pd.concat(all_valid_predictions, ignore_index=True)
+    predictions_path = model_dir / "predictions.csv"
+    metrics_path = model_dir / "metrics_per_fold.json"
+    segment_path = model_dir / "segment_metrics.csv"
+    manifest_path = model_dir / "manifest.json"
+    predictions.to_csv(predictions_path, index=False)
+    write_json(metrics_path, per_fold_metrics)
+    segment_metrics(predictions).to_csv(segment_path, index=False)
+
+    overall_metrics = regression_metrics(
+        predictions[TARGET_NAME].to_numpy(dtype=float),
+        predictions["prediction"].to_numpy(dtype=float),
+    )
+    manifest = {
+        "cycle_id": args.cycle_id,
+        "kanban_task_id": args.kanban_task_id,
+        "created_at_utc": datetime.now(timezone.utc).isoformat(),
+        "model_id": model_id,
+        "model_name": MODEL_SPECS[model_id]["model_name"],
+        "hf_model": args.model,
+        "target_name": TARGET_NAME,
+        "seed": args.seed,
+        "config_hash_algorithm": "sha256",
+        "config_hash": config_hash,
+        "feature_provenance_hash": feature_provenance_hash,
+        "split_manifest_sha256": split_hash,
+        "mlflow_experiment": args.experiment_name,
+        "mlflow_run_ids": run_ids,
+        "folds": folds,
+        "fold_count": len(folds),
+        "valid_prediction_count": int(len(predictions)),
+        "overall_valid_metrics": overall_metrics,
+        "artifact_paths": {
+            "predictions": str(predictions_path),
+            "metrics_per_fold": str(metrics_path),
+            "segment_metrics": str(segment_path),
+            "manifest": str(manifest_path),
+            "fold_run_json_glob": str(model_dir / "M5_run_fold_*.json"),
+        },
+        "package_versions": {
+            "python": sys.version.split()[0],
+            "numpy": np.__version__,
+            "pandas": pd.__version__,
+            "scipy": package_version("scipy"),
+            "scikit-learn": package_version("scikit-learn"),
+            "transformers": package_version("transformers"),
+            "torch": package_version("torch"),
+            "mlflow": package_version("mlflow"),
+            "pyyaml": package_version("PyYAML"),
+        },
+        "verification_command": (
+            f"python3 -c \"import json, pandas as pd; "
+            f"m=json.load(open('{manifest_path}')); "
+            f"p=pd.read_csv('{predictions_path}'); "
+            f"assert len(m['mlflow_run_ids']) == m['fold_count']; "
+            f"assert len(p) == m['valid_prediction_count']\""
         ),
     }
     write_json(manifest_path, manifest)
@@ -572,25 +871,26 @@ def train_model(
 
 
 def build_summary(
-    output_dir: Path, manifests: list[dict[str, Any]], cycle_id: int
+    output_dir: Path, manifests: list[dict[str, Any]], cycle_id: str
 ) -> Path:
     path = output_dir / "model_training_summary.md"
     metrics_by_model = {
         manifest["model_id"]: manifest["overall_valid_metrics"] for manifest in manifests
     }
-    gate_status = "PASS"
+    gate_status = "PASS_DIAGNOSTIC"
     gate_details: list[str] = []
-    for challenger in ["M3", "M4"]:
-        if metrics_by_model["M1"]["qwk"] <= metrics_by_model[challenger]["qwk"]:
+    ordered_present = [model_id for model_id in ["M1", "M2", "M3", "M4", "M5", "M6"] if model_id in metrics_by_model]
+    for previous, challenger in zip(ordered_present, ordered_present[1:]):
+        if metrics_by_model[previous]["qwk"] <= metrics_by_model[challenger]["qwk"]:
             gate_details.append(
-                f"M1 <= {challenger}: PASS "
-                f"({metrics_by_model['M1']['qwk']:.4f} <= {metrics_by_model[challenger]['qwk']:.4f})"
+                f"{previous} <= {challenger}: PASS "
+                f"({metrics_by_model[previous]['qwk']:.4f} <= {metrics_by_model[challenger]['qwk']:.4f})"
             )
         else:
-            gate_status = "FAIL_HARD_BLOCK"
+            gate_status = "FAIL_DIAGNOSTIC_REQUIRES_EVAL_CI"
             gate_details.append(
-                f"M1 <= {challenger}: FAIL "
-                f"({metrics_by_model['M1']['qwk']:.4f} > {metrics_by_model[challenger]['qwk']:.4f})"
+                f"{previous} <= {challenger}: FAIL "
+                f"({metrics_by_model[previous]['qwk']:.4f} > {metrics_by_model[challenger]['qwk']:.4f})"
             )
 
     lines = [
@@ -634,22 +934,39 @@ def build_summary(
             "",
             "## Gates",
             "",
-            f"Toy monotonicity hard gate: {gate_status}. M2 is excluded from ordering in Toy phase.",
+            f"Point-estimate monotonicity diagnostic: {gate_status}. Phase 2 hard acceptance is deferred to EVAL bootstrap CI (`model_lower95 > prev_model_upper95`).",
             "",
             *[f"- {detail}" for detail in gate_details],
             "",
             "Feature provenance gate: PASS, label_side_feature_count=0.",
-            "Toy-phase overfit warnings are recorded per fold in metrics_per_fold.json.",
+            "Train/valid QWK gap warnings are recorded per fold in metrics_per_fold.json.",
         ]
     )
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    if gate_status != "PASS":
-        raise RuntimeError("Toy monotonicity hard gate failed: M1 must be <= M3 and M4")
     return path
+
+
+def load_existing_model_manifests(output_dir: Path, replacing: set[str]) -> list[dict[str, Any]]:
+    manifests: list[dict[str, Any]] = []
+    for manifest_path in sorted(output_dir.glob("M*/manifest.json")):
+        manifest = load_json(manifest_path)
+        if manifest.get("model_id") not in replacing:
+            manifests.append(manifest)
+    return manifests
+
+
+def ordered_model_manifests(manifests: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    order = {model_id: index for index, model_id in enumerate(["M1", "M2", "M3", "M4", "M5", "M6"])}
+    return sorted(
+        manifests,
+        key=lambda manifest: order.get(str(manifest.get("model_id")), 999),
+    )
 
 
 def main() -> int:
     args = parse_args()
+    model_ids = normalize_model_ids(args.models)
+    args.models = model_ids
     output_dir = Path(args.output_dir)
     feature_dir = Path(args.feature_dir)
     split_dir = Path(args.split_dir)
@@ -661,6 +978,7 @@ def main() -> int:
         raise FileNotFoundError(split_dir)
 
     provenance = enforce_feature_provenance(feature_dir)
+    folds = discover_folds(feature_dir)
     training_config = load_training_config(args)
     config_path = output_dir / "training_config.yaml"
     write_yaml(config_path, training_config)
@@ -671,18 +989,37 @@ def main() -> int:
     mlflow.set_tracking_uri(args.mlflow_uri)
     mlflow.set_experiment(args.experiment_name)
 
-    manifests = []
-    for model_id in args.models:
-        manifests.append(
-            train_model(
-                model_id=model_id,
-                args=args,
-                output_dir=output_dir,
-                config_hash=config_hash,
-                split_hash=split_hash,
-                feature_provenance_hash=feature_provenance_hash,
+    manifests = load_existing_model_manifests(output_dir, replacing=set(model_ids))
+    for model_id in model_ids:
+        if model_id in {"M1", "M2", "M3", "M4"}:
+            manifests.append(
+                train_model(
+                    model_id=model_id,
+                    args=args,
+                    output_dir=output_dir,
+                    config_hash=config_hash,
+                    split_hash=split_hash,
+                    feature_provenance_hash=feature_provenance_hash,
+                    folds=folds,
+                )
             )
-        )
+        elif model_id == "M5":
+            manifests.append(
+                train_transformer_model(
+                    model_id=model_id,
+                    args=args,
+                    output_dir=output_dir,
+                    config_hash=config_hash,
+                    split_hash=split_hash,
+                    feature_provenance_hash=feature_provenance_hash,
+                    folds=folds,
+                )
+            )
+        else:
+            raise NotImplementedError(
+                "M6 is implemented in pipelines.train_ensemble and is scheduled for the HPO/ensemble task"
+            )
+    manifests = ordered_model_manifests(manifests)
 
     summary_path = build_summary(output_dir, manifests, args.cycle_id)
     index_manifest = {
@@ -697,6 +1034,8 @@ def main() -> int:
         "feature_provenance_label_side_count": provenance.get("label_side_feature_count"),
         "split_manifest_path": str(split_dir / "split_manifest.yaml"),
         "split_manifest_sha256": split_hash,
+        "folds": folds,
+        "fold_count": len(folds),
         "summary_path": str(summary_path),
         "model_manifests": [manifest["artifact_paths"]["manifest"] for manifest in manifests],
         "verification_commands": [
@@ -707,9 +1046,9 @@ def main() -> int:
                 "assert exp is not None\""
             ),
             (
-                "python3 -c \"import pandas as pd; "
-                f"assert all(len(pd.read_csv('{output_dir}/M{{i}}/predictions.csv')) == 342 "
-                "for i in range(1,5))\""
+                "python3 -c \"from pathlib import Path; import pandas as pd; "
+                f"paths=sorted(Path('{output_dir}').glob('M*/predictions.csv')); "
+                "assert paths and all(len(pd.read_csv(path)) == 5003 for path in paths)\""
             ),
         ],
     }

@@ -120,29 +120,29 @@ def run_with_mlflow_parent(
 
 def build_m4_objective_factory(
     *,
-    split_dir: Path,
     feature_dir: Path,
     label_dir: Path,
     seed: int,
 ) -> Callable[[], Callable[[optuna.Trial], float]]:
     """Returns a factory that builds an M4 LightGBM objective.
 
-    Each trial trains LightGBM on the discovered folds and returns mean valid MAE
-    (minimize). Search space per task body: learning_rate, num_leaves,
-    min_child_samples, reg_alpha.
+    Uses train.py helpers (discover_folds, load_fold_data, select_features,
+    build_estimator) so HPO trials run the same code path as final M4 training.
+    Search space per task body: learning_rate, num_leaves, min_child_samples, reg_alpha.
     """
 
     def factory() -> Callable[[optuna.Trial], float]:
-        # Lazy import: avoids requiring lightgbm at module load
+        import numpy as np
+
         from pipelines.train import (
+            TARGET_NAME,
+            build_estimator,
             discover_folds,
-            load_features,
-            load_labels,
-            train_lightgbm_single_fold,
+            load_fold_data,
+            select_features,
         )
 
-        folds = discover_folds(split_dir, feature_dir)
-        labels = load_labels(label_dir)
+        folds = discover_folds(feature_dir)
 
         def objective(trial: optuna.Trial) -> float:
             hparams = {
@@ -153,15 +153,20 @@ def build_m4_objective_factory(
             }
             fold_maes: list[float] = []
             for fold in folds:
-                X_train, y_train, X_valid, y_valid = load_features(fold, labels)
-                _, valid_pred = train_lightgbm_single_fold(
-                    X_train=X_train,
-                    y_train=y_train,
-                    X_valid=X_valid,
-                    hparams=hparams,
-                    seed=seed,
+                matrix, labels, row_manifest = load_fold_data(
+                    fold=fold, feature_dir=feature_dir, label_dir=label_dir
                 )
-                fold_maes.append(float(abs(y_valid - valid_pred).mean()))
+                train_mask = (labels["partition"] == "train").to_numpy()
+                valid_mask = (labels["partition"] == "valid").to_numpy()
+                y_train = labels.loc[train_mask, TARGET_NAME].to_numpy(dtype=float)
+                y_valid = labels.loc[valid_mask, TARGET_NAME].to_numpy(dtype=float)
+                selected = select_features("M4", matrix, row_manifest)
+                x_train = selected[train_mask]
+                x_valid = selected[valid_mask]
+                estimator = build_estimator("M4", seed, hparams=hparams)
+                estimator.fit(x_train, y_train)
+                valid_pred = np.asarray(estimator.predict(x_valid), dtype=float)
+                fold_maes.append(float(np.abs(y_valid - valid_pred).mean()))
             return float(sum(fold_maes) / len(fold_maes))
 
         return objective
@@ -171,24 +176,30 @@ def build_m4_objective_factory(
 
 def build_m5_objective_factory(
     *,
-    split_dir: Path,
     feature_dir: Path,
     label_dir: Path,
     hf_model: str,
     seed: int,
+    output_root: Path,
 ) -> Callable[[], Callable[[optuna.Trial], float]]:
     """Returns a factory that builds an M5 KLUE-RoBERTa objective.
 
-    Search space per task body: learning_rate(log[1e-5,5e-5]), batch_size{8,16,32},
-    epochs{2..5}, weight_decay, warmup_ratio. Returns mean valid MAE.
+    Reuses train.py load_fold_data + load_model_text to assemble raw text per fold
+    (same code path as full M5 training). Search space per task body:
+    learning_rate(log[1e-5,5e-5]), batch_size{8,16,32}, epochs[2,5], weight_decay,
+    warmup_ratio. Returns mean valid MAE.
     """
 
     def factory() -> Callable[[optuna.Trial], float]:
-        from pipelines.train import discover_folds, load_labels
+        from pipelines.train import (
+            TARGET_NAME,
+            discover_folds,
+            load_fold_data,
+            load_model_text,
+        )
         from pipelines.train_transformer import train_transformer
 
-        folds = discover_folds(split_dir, feature_dir)
-        labels = load_labels(label_dir)
+        folds = discover_folds(feature_dir)
 
         def objective(trial: optuna.Trial) -> float:
             hparams = {
@@ -202,15 +213,26 @@ def build_m5_objective_factory(
             }
             fold_maes: list[float] = []
             for fold in folds:
-                train_df = labels.loc[fold["train_idx"]]
-                valid_df = labels.loc[fold["valid_idx"]]
+                _, labels, _ = load_fold_data(
+                    fold=fold, feature_dir=feature_dir, label_dir=label_dir
+                )
+                labels["text"] = [
+                    load_model_text(label_dir, row.relative_path, row.essay_id)
+                    for row in labels.itertuples(index=False)
+                ]
+                train_df = labels.loc[labels["partition"] == "train", ["text", TARGET_NAME]].rename(
+                    columns={TARGET_NAME: "score"}
+                )
+                valid_df = labels.loc[labels["partition"] == "valid", ["text", TARGET_NAME]].rename(
+                    columns={TARGET_NAME: "score"}
+                )
                 result = train_transformer(
                     train_df=train_df,
                     valid_df=valid_df,
                     hparams=hparams,
                     model_name=hf_model,
                     tokenizer_name=hf_model,
-                    output_dir=str(Path("/tmp/hpo_m5") / f"trial_{trial.number}"),
+                    output_dir=str(output_root / f"trial_{trial.number}_fold_{fold}"),
                     max_length=256,
                     text_col="text",
                     label_col="score",
@@ -249,7 +271,6 @@ def main() -> int:
 
     if args.model == "M4":
         factory = build_m4_objective_factory(
-            split_dir=Path(args.split_dir),
             feature_dir=Path(args.feature_dir),
             label_dir=Path(args.label_dir),
             seed=args.sampler_seed,
@@ -260,11 +281,11 @@ def main() -> int:
         )
     else:  # M5
         factory = build_m5_objective_factory(
-            split_dir=Path(args.split_dir),
             feature_dir=Path(args.feature_dir),
             label_dir=Path(args.label_dir),
             hf_model=args.hf_model,
             seed=args.sampler_seed,
+            output_root=output_dir / "trials",
         )
         parent_params["search_space"] = (
             "learning_rate log[1e-5,5e-5], batch_size{8,16,32}, epochs[2,5], "
