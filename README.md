@@ -182,4 +182,8 @@ vastai --api-key "$VAST_API_KEY" search offers 'gpu_ram>=8 reliability>0.95' --r
 
 ## License
 
-내부 연구용입니다.
+Code in this repository is licensed under the [MIT License](LICENSE).
+
+Dataset files, source PDFs, and external model/data assets remain subject to
+their original provider terms. Verify redistribution rights before reusing data
+files outside this repository.
