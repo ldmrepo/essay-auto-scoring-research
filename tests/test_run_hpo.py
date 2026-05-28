@@ -17,6 +17,7 @@ from pipelines.run_hpo import (
     compute_feature_provenance,
     enforce_min_trials,
     parse_args,
+    resolve_label_dir,
     run_with_mlflow_parent,
     sha256_file,
 )
@@ -144,6 +145,21 @@ class TestFeatureProvenanceTag:
         feature_dir.mkdir()
         with pytest.raises(FileNotFoundError, match="feature_provenance_manifest"):
             compute_feature_provenance(feature_dir)
+
+
+class TestLabelDirResolution:
+    def test_accepts_sample_root_when_label_subdir_exists(self, tmp_path):
+        sample_root = tmp_path / "sample_5k"
+        label_root = sample_root / "라벨링데이터"
+        label_root.mkdir(parents=True)
+
+        assert resolve_label_dir(sample_root) == label_root
+
+    def test_keeps_explicit_label_root(self, tmp_path):
+        label_root = tmp_path / "라벨링데이터"
+        label_root.mkdir()
+
+        assert resolve_label_dir(label_root) == label_root
 
 
 class TestObjectiveFactoryImports:

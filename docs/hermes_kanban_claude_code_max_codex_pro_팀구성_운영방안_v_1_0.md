@@ -1,9 +1,9 @@
 # Hermes Kanban 기반 Claude Code Max · Codex Pro 팀 구성 운영 방안
 
-문서 버전: v1.0  
-작성일: 2026-05-27  
-문서명: Hermes_Kanban_Claude_Code_Max_Codex_Pro_팀구성_운영방안_v1_0.md  
-대상 프로젝트: AI 서술형 자동채점 모델 구축 연구 / 장기 실행형 AI 개발·연구 프로젝트  
+문서 버전: v1.0
+작성일: 2026-05-27
+문서명: Hermes_Kanban_Claude_Code_Max_Codex_Pro_팀구성_운영방안_v1_0.md
+대상 프로젝트: AI 서술형 자동채점 모델 구축 연구 / 장기 실행형 AI 개발·연구 프로젝트
 적용 도구: Hermes Agent, Hermes Kanban Multi-Agent Board, Claude Code Max, Codex Pro, GitHub, MLflow, DVC, Optuna
 
 ---

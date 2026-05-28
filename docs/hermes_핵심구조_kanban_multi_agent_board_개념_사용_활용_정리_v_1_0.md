@@ -1,9 +1,9 @@
 # Hermes 핵심 구조 및 Kanban Multi-Agent Board 개념·사용·활용 정리
 
-문서 버전: v1.0  
-작성일: 2026-05-27  
-문서명: Hermes_핵심구조_Kanban_Multi_Agent_Board_개념_사용_활용_정리_v1_0.md  
-대상 도구: Hermes Agent  
+문서 버전: v1.0
+작성일: 2026-05-27
+문서명: Hermes_핵심구조_Kanban_Multi_Agent_Board_개념_사용_활용_정리_v1_0.md
+대상 도구: Hermes Agent
 주제: Hermes 핵심 구조, Profile, Skill, Cron, Gateway, Kanban Multi-Agent Board, 장기 실행형 협업 활용
 
 ---

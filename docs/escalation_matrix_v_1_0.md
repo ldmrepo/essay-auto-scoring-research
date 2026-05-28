@@ -1,150 +1,82 @@
 # Escalation Matrix
 
-Task: `t_7aa8b610`  
-Date: 2026-05-27  
-Scope: Cycle 2+ failure handling, resource control, and forbidden escalation boundaries
+> 갱신일: 2026-05-28
+> 범위: Phase 2 Hermes Kanban task failure, block, cost, policy boundary handling
 
-## 1. Purpose
+## 1. Failure Levels
 
-This document defines how Hermes should respond when autonomous research tasks fail, stall, or approach policy boundaries.
+| Repeated failure | Action |
+|---:|---|
+| 1 | same assignee retry, failed command and artifact path 기록 |
+| 2 | reassign or sub-decompose |
+| 3 | blocked + human gate task |
 
-The matrix protects two goals at the same time:
+Silent failure는 허용하지 않습니다. 모든 block은 reason, reproduction command, artifact path, next action을 남깁니다.
 
-1. Keep routine research work moving without requiring a human for every transient failure.
-2. Ensure safety-critical changes, leakage findings, privacy decisions, phase transitions, and production actions stop at an explicit human gate.
+## 2. Block Metadata
 
-Cycle 1 showed the need for this distinction. T5 recovered after dependency and toy-policy clarification, while T7 correctly blocked the pipeline on a real leakage issue.
+Blocked task metadata/comment must include:
 
-## 2. Failure Levels
+| Field | Meaning |
+|---|---|
+| `reason` | 짧은 차단 사유 |
+| `failed_command` | 재현 명령 |
+| `artifact_paths` | log/report/manifest path |
+| `policy_reference` | 관련 Hard Rule 또는 문서 |
+| `next_action` | unblock을 위한 최소 행동 |
 
-Consecutive failures are counted per task or per logical task family when a task is decomposed into retries.
+## 3. Routing
 
-| Consecutive failures | Action | Owner | Notes |
-| ---: | --- | --- | --- |
-| 1 | Automatic retry | Same assignee | Suitable for transient environment, timeout, or command failure. Metadata must include the failed command and error summary. |
-| 2 | Reassign or sub-decompose | Research Master / Project Planner | Reassign to a better profile or split the task into smaller implementation, verification, and report tasks. |
-| 3 | Create Layer 3 human-gate task | Research Master | Mark the blocked task and create a decision task asking whether to change mutable policy, narrow scope, or stop. |
-
-No failure level permits automatic edits to locked rules or automatic phase transition.
-
-## 3. Failure-Type Routing
-
-| Failure type | Example from Cycle 1 | Default response |
-| --- | --- | --- |
-| Missing dependency | T5 initially blocked when MLflow was unavailable. | Block with install/verification command; retry after dependency availability. |
-| Schema mismatch | T1 found `student_school` absent and used human-approved `student.location` proxy after clarification. | Block for policy/schema decision when the rule and data disagree. |
-| Policy ambiguity | T5 initially treated toy monotonic/ceiling warnings as hard blocks. | Block or ask for clarification; do not silently downgrade a hard rule. |
-| Review finding | T7 found label-side feature leakage. | Hard block acceptance and require a fix cycle. |
-| Small-sample instability | Toy fold sizes and ceiling CI are noisy. | Warn in toy phase; full phase requires CI-based hard gates. |
-| Cron gap | T8 found cron trigger not observed. | Add a narrow Layer 2 validation task, separate from model acceptance. |
+| Failure type | Default response |
+|---|---|
+| dependency missing | block with install/check command |
+| CLI/API incompatibility | document exact command and replacement command |
+| split leakage or fold invalid | hard-block SPLIT and propose split redesign |
+| label-side feature | hard-block FEATURE/MODEL acceptance |
+| HPO trial < 30 | hard-block HPO/REVIEW |
+| score-band fairness fail | hard-block EVAL acceptance |
+| cost circuit breaker | pause + human notification task |
+| repeated model underperformance | continue with concrete next-cycle recommendation or stop after repeated no-gain |
 
 ## 4. Resource Limits
 
-The board must bound autonomous expansion so self-improvement cannot create uncontrolled work.
+`configs/board_config.yaml` is the source of truth.
 
-Recommended defaults:
+| Setting | Current |
+|---|---|
+| max concurrent cycles | 1 |
+| max tasks per cycle | 12 |
+| max cycles | 30 |
+| max consecutive failures | 3 |
+| max USD per cycle | 20.0 |
 
-| Setting | Draft value | Rationale |
-| --- | ---: | --- |
-| `max_concurrent_cycles` | 1 | Prevent overlapping research cycles from mixing artifacts or decisions. |
-| `max_tasks_per_cycle` | 12 | Enough for audit, implementation, evaluation, review, reporting, and one follow-up decomposition. |
-| `max_consecutive_failures` | 3 | Matches the escalation threshold for a human-gated policy decision. |
-| `max_active_modeling_tasks` | 1 | Avoid concurrent writes to shared model artifacts in the current non-worktree setup. |
-| `max_active_review_tasks` | 1 | Preserve a clear acceptance gate. |
+## 5. Human Gate Required
 
-If a cycle would exceed `max_tasks_per_cycle`, the Research Master should create a planning summary instead of spawning more tasks.
+The board must not autonomously do these:
 
-## 5. DECIDE Timeout Handling
+- change hard rules
+- change acceptance criteria
+- phase-up to full dataset
+- include Validation holdout in training folds
+- register final model/champion alias
+- deploy externally
+- alter student privacy/data policy
 
-DECIDE tasks must carry an explicit timeout block.
+## 6. DECIDE Timeout
 
-| Field | Allowed values | Recommended Cycle 2 value |
-| --- | --- | --- |
-| `human_decision_timeout` | Duration string such as `24h`, `72h`, `7d` | `72h` |
-| `default_on_timeout` | `Continue` or `Stop` | `Stop` |
-| `timeout_comment_required` | `true` or `false` | `true` |
+| Case | Behavior |
+|---|---|
+| current-phase continuation within 6h grace | default Continue allowed |
+| 6h~24h | Pause |
+| phase-up | never automatic |
 
-Defaulting to `Continue` is allowed only for a maintenance-only cycle where every follow-up task is already within locked toy scope. It is not appropriate for phase-up, privacy, production, or acceptance-criteria decisions.
+DECIDE labels are `[Continue]`, `[Phase-up]`, `[Stop]`.
 
-## 6. Layer 3 Gate
-
-Layer 3 means the board wants to change its own mutable operating policy. It is not permission to edit locked rules.
-
-A Layer 3 human-gate task must include:
-
-1. The failed task id and failure count.
-2. The current policy that caused the block or repeated failure.
-3. The proposed mutable-policy change.
-4. The risk of making the change.
-5. A rollback path.
-6. A verification command.
-
-Allowed Layer 3 proposals:
-
-| Proposal | Allowed? | Reason |
-| --- | --- | --- |
-| Lower `max_tasks_per_cycle` after overload | Yes | Operational safety default. |
-| Reassign repeated feature tasks from `gauss` to `ada-lovelace` | Yes | Routing policy only. |
-| Add a stale-task report cadence | Yes | Ops policy only. |
-| Treat toy ceiling warnings as report-only | Only if already allowed by locked policy | Cannot contradict hard rules. |
-
-## 7. Layer 3 and Layer 4 Forbidden Cases
-
-The following cases must not be handled by autonomous mutable-policy edits.
-
-| Case | Required handling |
-| --- | --- |
-| Champion alias replacement | Human approval and release/registry task only. |
-| Student PII policy change | Human approval; security/privacy review required. |
-| Hard Rule text modification | Human approval; never automatic. |
-| Full dataset loading | Human phase-up approval first. |
-| Transformer training | Human phase-up approval first. |
-| External deployment | Human approval; deployment plan and canary verification required. |
-| Final model registration | Human approval; forbidden in toy phase. |
-| Acceptance criteria change | Human approval with decision log. |
-| Leakage hard-block downgrade | Human approval; reviewer must sign off. |
-
-Layer 4 auto-phase-transition remains forbidden. The board may prepare a phase-up recommendation, but it may not execute phase-up.
-
-## 8. Block Metadata Requirements
-
-Every blocked task must include enough metadata for a later agent or human to reproduce the issue.
-
-Required fields:
-
-| Field | Description |
-| --- | --- |
-| `reason` | Short human-readable block reason. |
-| `failed_command` | Exact command that reproduced the failure, if applicable. |
-| `artifact_paths` | Paths to reports, logs, manifests, or partial outputs. |
-| `policy_reference` | Rule or document section that required blocking. |
-| `next_action` | The smallest action that would unblock the task. |
-
-Silent failure is not allowed. If the task cannot produce an artifact, it must still record a reason and command or evidence path.
-
-## 9. Cycle 2 Escalation Defaults
-
-Cycle 2 should start with these defaults:
-
-| Policy | Value |
-| --- | --- |
-| Max concurrent cycles | 1 |
-| Max tasks per cycle | 12 |
-| Max consecutive failures | 3 |
-| Human decision timeout | `72h` |
-| Default on DECIDE timeout | `Stop` |
-| Cron validation | Isolated Layer 2 task only |
-| Phase-up | Human gated |
-
-These defaults can be represented in `configs/board_config.yaml`.
-
-## 10. Verification
-
-This escalation matrix is verified by:
+## 7. Verification
 
 ```bash
-test -f docs/escalation_matrix_v_1_0.md
-python3 -c "import pathlib; p=pathlib.Path('docs/escalation_matrix_v_1_0.md'); assert p.read_text().count('\\n## ') >= 6"
+hermes kanban diagnostics
+hermes kanban stats
+hermes kanban runs <task_id>
+hermes kanban log <task_id>
 ```
-
-The matrix explicitly covers 1, 2, and 3 consecutive failures; resource limits; DECIDE timeout behavior; and forbidden Layer 3-4 cases.

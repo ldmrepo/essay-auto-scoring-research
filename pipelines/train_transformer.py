@@ -27,6 +27,7 @@ def train_transformer(
     tokenizer_name: Optional[str] = None,
     max_length: int = 256,
     seed: int = 42,
+    save_model: bool = True,
 ) -> dict[str, Any]:
     """Fine-tune a transformer regression model. Returns metrics + predictions + model_path."""
     import torch
@@ -125,9 +126,9 @@ def train_transformer(
     valid_rmse = float(np.sqrt(mean_squared_error(valid_labels, valid_predictions)))
     valid_loss = float(np.mean((valid_predictions - valid_labels) ** 2))
 
-    # Save model artifact
     model_path = output_dir_p / "model"
-    trainer.save_model(str(model_path))
+    if save_model:
+        trainer.save_model(str(model_path))
 
     return {
         "train_loss": train_loss,
@@ -138,6 +139,6 @@ def train_transformer(
         "valid_mae": valid_mae,
         "valid_rmse": valid_rmse,
         "valid_predictions": valid_predictions,
-        "model_path": str(model_path),
+        "model_path": str(model_path) if save_model else None,
         "hparams": hparams,
     }

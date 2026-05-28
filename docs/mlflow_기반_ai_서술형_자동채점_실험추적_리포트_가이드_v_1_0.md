@@ -1,9 +1,9 @@
 # MLflow 기반 AI 서술형 자동채점 실험추적·리포트 가이드
 
-문서 버전: v1.0  
-작성일: 2026-05-27  
-문서명: MLflow_기반_AI_서술형_자동채점_실험추적_리포트_가이드_v1_0.md  
-대상 프로젝트: AI 서술형 자동채점 모델 구축 연구  
+문서 버전: v1.0
+작성일: 2026-05-27
+문서명: MLflow_기반_AI_서술형_자동채점_실험추적_리포트_가이드_v1_0.md
+대상 프로젝트: AI 서술형 자동채점 모델 구축 연구
 연계 구조: Hermes Kanban Multi-Agent Board, Codex Pro, Claude Code Max, DVC, Optuna, GitHub
 
 ---

@@ -5,11 +5,19 @@
 # MLflow runtime (re-generatable)
 mlflow.db
 mlflow.db-journal
+mlflow_*.db
+mlflow_*.db-journal
 mlruns/
 mlruns_legacy/
 
+# Optuna study DB (re-generatable from pipelines.run_hpo)
+optuna.db
+optuna.db-journal
+
 # Cycle workspace outputs (re-generatable from pipelines/)
+workspace/
 workspace/cycle_*/
+workspace/pii_audit_*.json
 
 # Generated reports
 reports/latest/
@@ -33,6 +41,13 @@ venv/
 *.swo
 .vscode/
 .idea/
+
+# Office lock files + temp
+~$*
+*.tmp
+
+# Serena MCP server internal state
+.serena/
 
 # Windows ADS (WSL)
 *:Zone.Identifier

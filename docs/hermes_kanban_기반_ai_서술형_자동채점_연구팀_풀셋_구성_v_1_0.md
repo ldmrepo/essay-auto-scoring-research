@@ -1,10 +1,10 @@
 # Hermes Kanban 기반 AI 서술형 자동채점 연구팀 풀셋 구성
 
-문서 버전: v1.0  
-작성일: 2026-05-27  
-문서명: Hermes_Kanban_기반_AI_서술형_자동채점_연구팀_풀셋_구성_v1_0.md  
-대상 프로젝트: AI 서술형 자동채점 모델 구축 연구  
-운영 방식: Hermes Kanban Multi-Agent Board 기반 장기 실행형 연구팀  
+문서 버전: v1.0
+작성일: 2026-05-27
+문서명: Hermes_Kanban_기반_AI_서술형_자동채점_연구팀_풀셋_구성_v1_0.md
+대상 프로젝트: AI 서술형 자동채점 모델 구축 연구
+운영 방식: Hermes Kanban Multi-Agent Board 기반 장기 실행형 연구팀
 연계 도구: Hermes Agent, Claude Code Max, Codex Pro, GitHub, MLflow, DVC, Optuna
 
 ---

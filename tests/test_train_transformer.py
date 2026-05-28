@@ -111,3 +111,28 @@ class TestTrainTransformer:
             label_col="score",
         )
         assert result["hparams"] == hparams
+
+    def test_can_skip_model_artifact_for_hpo_trials(self, tmp_path):
+        df = _synthetic_df()
+        result = train_transformer(
+            train_df=df.iloc[:15],
+            valid_df=df.iloc[15:],
+            hparams={
+                "learning_rate": 1e-4,
+                "per_device_train_batch_size": 4,
+                "num_train_epochs": 1,
+                "weight_decay": 0.01,
+                "warmup_ratio": 0.0,
+            },
+            model_name=None,
+            model_init=_tiny_random_model_init,
+            tokenizer_name="klue/bert-base",
+            output_dir=str(tmp_path / "tf_hpo_trial"),
+            max_length=32,
+            text_col="text",
+            label_col="score",
+            save_model=False,
+        )
+
+        assert result["model_path"] is None
+        assert not (tmp_path / "tf_hpo_trial" / "model").exists()

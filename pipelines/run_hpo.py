@@ -22,6 +22,7 @@ from typing import Any, Callable
 
 import mlflow
 import optuna
+from optuna.trial import TrialState
 from optuna.pruners import MedianPruner
 from optuna.samplers import TPESampler
 
@@ -50,6 +51,17 @@ def compute_feature_provenance(feature_dir: Path) -> str:
             "run pipelines.build_features first."
         )
     return sha256_file(manifest_path)
+
+
+def resolve_label_dir(label_dir: Path) -> Path:
+    """Accept either the sample root or the actual label root.
+
+    Task specs often pass `dataset/sample_5k`, while train.py consumes paths
+    relative to `dataset/sample_5k/라벨링데이터`.
+    """
+    if (label_dir / "라벨링데이터").is_dir():
+        return label_dir / "라벨링데이터"
+    return label_dir
 
 
 def parse_args() -> argparse.Namespace:
@@ -141,12 +153,15 @@ def run_with_mlflow_parent(
         for pname, pval in study.best_params.items():
             mlflow.log_param(f"best_{pname}", pval)
         mlflow.log_metric("best_value", float(study.best_value))
-        mlflow.log_metric("n_trials_completed", float(len(study.trials)))
+        n_trials_completed = len(
+            [trial for trial in study.trials if trial.state == TrialState.COMPLETE]
+        )
+        mlflow.log_metric("n_trials_completed", float(n_trials_completed))
 
         return {
             "best_params": dict(study.best_params),
             "best_value": float(study.best_value),
-            "n_trials_completed": len(study.trials),
+            "n_trials_completed": n_trials_completed,
             "study_name": study_name,
             "parent_run_id": parent_run.info.run_id,
         }
@@ -271,6 +286,7 @@ def build_m5_objective_factory(
                     text_col="text",
                     label_col="score",
                     seed=seed,
+                    save_model=False,
                 )
                 fold_maes.append(float(result["valid_mae"]))
             return float(sum(fold_maes) / len(fold_maes))
@@ -289,6 +305,7 @@ def main() -> int:
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    label_dir = resolve_label_dir(Path(args.label_dir))
 
     feature_provenance_hash = compute_feature_provenance(Path(args.feature_dir))
     parent_tags = {
@@ -308,7 +325,7 @@ def main() -> int:
     if args.model == "M4":
         factory = build_m4_objective_factory(
             feature_dir=Path(args.feature_dir),
-            label_dir=Path(args.label_dir),
+            label_dir=label_dir,
             seed=args.sampler_seed,
         )
         parent_params["search_space"] = (
@@ -318,7 +335,7 @@ def main() -> int:
     else:  # M5
         factory = build_m5_objective_factory(
             feature_dir=Path(args.feature_dir),
-            label_dir=Path(args.label_dir),
+            label_dir=label_dir,
             hf_model=args.hf_model,
             seed=args.sampler_seed,
             output_root=output_dir / "trials",

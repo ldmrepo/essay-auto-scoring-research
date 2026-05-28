@@ -1,5 +1,13 @@
 # Milestone Goal v2 (Phase 2 Mid-scale)
 
+> **🛑 Phase 2 종료 (2026-05-28, 사용자 명시 결정)**
+>
+> - **도달 상태**: Cycle M1 진행 중 종료. M1~M4 baseline 완료 (M4 QWK 0.2635), M5 KLUE-RoBERTa 미완 (vast.ai worker hang 패턴 + codex app-server 10분 timeout으로 학습 결과 회수 실패), HPO/EVAL/REVIEW/SYNTH/DECIDE 미수행
+> - **종료 사유**: 단일 타겟(`essay_scoreT_avg`) 학습 설계가 사용자 실제 목적(루브릭별 차원 점수)과 불일치. 데이터셋의 다차원 채점(표현/구성/내용 × 채점자 3명 × 소분류 9~11개) 정보 활용 부족
+> - **보존 산출**: `workspace/cycle_M1/{audit,splits,features,models/M{1,2,3,4}}/` (재현 가능)
+> - **archive 처리**: t_13e1eaaa (HPO), t_1bab6d23 (EVAL), t_785a48e3 (REVIEW), t_171d099a (SYNTH), t_617de071 (DECIDE-M1)
+> - **Phase 3 진입 대기**: multi-task 모델 설계 (`docs/multi_task_채점모델_구현_스펙_v_1_0.md`) 기준으로 새 milestone 작성 예정
+>
 > Hard Rule #10 source — Cycle MN의 AUDIT sub-task body에 verbatim 재주입되는 goal anchor.
 > 본 문서는 변경 시 AGENTS.md LOCKED 변경과 동일한 인간 게이트 필요.
 
