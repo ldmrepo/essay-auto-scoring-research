@@ -28,8 +28,36 @@ def train_transformer(
     max_length: int = 256,
     seed: int = 42,
     save_model: bool = True,
+    rubric_json_col: Optional[str] = None,
 ) -> dict[str, Any]:
-    """Fine-tune a transformer regression model. Returns metrics + predictions + model_path."""
+    """Fine-tune a transformer regression model. Returns metrics + predictions + model_path.
+
+    Phase 3 multi-task wire-up (P3-W3): `rubric_json_col`이 지정되고 dataframe에 해당 컬럼이
+    있으면 학습 진입 직전 `validate_rubric_for_phase3` 사전 검증. drift essay 발견 시 `RuntimeError`.
+    Phase 2 호환을 위해 기본은 비활성 (rubric_json_col=None).
+    """
+    # P3-W3 fix (R1-NNF1 + R1-REG-H1 운영 보강): Phase 3 학습 직전 사전 검증
+    if rubric_json_col is not None:
+        from pipelines.extract_5k import validate_rubric_for_phase3
+        for df_name, df in (("train_df", train_df), ("valid_df", valid_df)):
+            if rubric_json_col not in df.columns:
+                raise ValueError(
+                    f"train_transformer: rubric_json_col='{rubric_json_col}' not in {df_name}. "
+                    "Phase 3 multi-task 학습 시 rubric JSON dict 컬럼 필수."
+                )
+            drift = []
+            for idx, rubric_doc in enumerate(df[rubric_json_col]):
+                ok, reason = validate_rubric_for_phase3(rubric_doc)
+                if not ok:
+                    drift.append((idx, reason))
+                    if len(drift) >= 3:
+                        break
+            if drift:
+                drift_msg = "; ".join(f"row {i}: {r}" for i, r in drift[:3])
+                raise RuntimeError(
+                    f"train_transformer: rubric spec drift in {df_name} — {drift_msg}. "
+                    "extract_5k --validate-rubric로 사전 skip 필수 (Hard Rule #15)."
+                )
     import torch
     from sklearn.metrics import mean_absolute_error, mean_squared_error
     from transformers import (

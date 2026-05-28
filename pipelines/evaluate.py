@@ -33,6 +33,14 @@ SCORE_BAND_HIGH = "high_20_30"
 SCORE_BAND_LOW_MIN_N = 10
 FAIRNESS_GATE_RATIO = 0.7
 
+# Phase 3 Stage 1 WIRE-UP (2026-05-28): mid_multitask 분기 + per-rubric fairness gate
+# 차원별 score band cutoff (native 0~3, ACCEPTANCE_CRITERIA `mid_multitask.score_band_cutoffs.per_rubric_native`)
+SCORE_BAND_PR_LOW = "low_0_1"
+SCORE_BAND_PR_MID = "mid_1_2"
+SCORE_BAND_PR_HIGH = "high_2_3"
+PER_RUBRIC_DIMENSIONS = ("exp", "org", "cont")    # overall은 raw 0~30 별도
+ALL_DIMENSIONS = ("exp", "org", "cont", "overall")
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -223,6 +231,266 @@ def score_band(score: float) -> str:
     if score < 20:
         return SCORE_BAND_MID
     return SCORE_BAND_HIGH
+
+
+def score_band_per_rubric(score: float) -> str:
+    """차원별 native 0~3 score → band 분류 (Phase 3 Stage 1 WIRE-UP).
+
+    Spec: ACCEPTANCE_CRITERIA.yaml `mid_multitask.score_band_cutoffs.per_rubric_native`
+    - low_0_1: ≤ 1.0
+    - mid_1_2: 1.0 < x ≤ 2.0
+    - high_2_3: > 2.0
+    """
+    if score <= 1.0:
+        return SCORE_BAND_PR_LOW
+    if score <= 2.0:
+        return SCORE_BAND_PR_MID
+    return SCORE_BAND_PR_HIGH
+
+
+def _fairness_gate_for_single_dim(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    bands: np.ndarray,
+    band_names: tuple[str, str, str],
+    rng: np.random.Generator,
+    bootstrap_b: int,
+) -> dict[str, Any]:
+    """단일 차원에 대한 fairness gate 산출 (helper for fairness_gate_per_rubric).
+
+    `fairness_gate()` overall 로직을 단일 차원에 적용. macro_qwk + worst_band_qwk(mid/high min) + acceptance.
+    """
+    low_name, mid_name, high_name = band_names
+    band_list = [low_name, mid_name, high_name]
+    per_band: dict[str, dict[str, Any]] = {}
+    for band in band_list:
+        mask = bands == band
+        n = int(mask.sum())
+        if n == 0:
+            per_band[band] = {"n": 0, "qwk": None, "status": "EMPTY"}
+            continue
+        bt = y_true[mask]
+        bp = y_pred[mask]
+        qwk_val = qwk_score(bt, bp)
+        ci = bootstrap_ci(bt, bp, qwk_score, rng, bootstrap_b)
+        per_band[band] = {
+            "n": n,
+            "qwk": float(qwk_val),
+            "qwk_lower95": ci["lower95"],
+            "qwk_upper95": ci["upper95"],
+            "status": "OK",
+        }
+
+    eligible = [
+        (b, per_band[b])
+        for b in band_list
+        if per_band[b]["status"] == "OK"
+        and (b != low_name or per_band[b]["n"] >= SCORE_BAND_LOW_MIN_N)
+    ]
+    unstable_low = (
+        per_band[low_name]["status"] == "OK"
+        and per_band[low_name]["n"] < SCORE_BAND_LOW_MIN_N
+    )
+
+    if not eligible:
+        return {
+            "per_band": per_band,
+            "macro_qwk": None,
+            "worst_band_qwk": None,
+            "worst_band_name": None,
+            "low_band_status": "SKIP_UNSTABLE" if unstable_low else "MISSING",
+            "acceptance_pass": False,
+            "acceptance_reason": "no_eligible_bands",
+        }
+
+    macro_qwk = float(np.mean([entry["qwk"] for _, entry in eligible]))
+    mid_high = [(b, entry) for b, entry in eligible if b in {mid_name, high_name}]
+    if mid_high:
+        worst_b, worst_entry = min(mid_high, key=lambda kv: kv[1]["qwk"])
+    else:
+        worst_b, worst_entry = min(eligible, key=lambda kv: kv[1]["qwk"])
+    worst_band_qwk = float(worst_entry["qwk"])
+    acceptance_pass = worst_band_qwk >= macro_qwk * FAIRNESS_GATE_RATIO
+    return {
+        "per_band": per_band,
+        "macro_qwk": macro_qwk,
+        "worst_band_qwk": worst_band_qwk,
+        "worst_band_name": worst_b,
+        "low_band_status": "SKIP_UNSTABLE" if unstable_low else "OK",
+        "acceptance_threshold": macro_qwk * FAIRNESS_GATE_RATIO,
+        "acceptance_pass": bool(acceptance_pass),
+        "acceptance_reason": (
+            f"worst_band_qwk={worst_band_qwk:.4f} "
+            f"{'>=' if acceptance_pass else '<'} "
+            f"macro_qwk * {FAIRNESS_GATE_RATIO} = "
+            f"{macro_qwk * FAIRNESS_GATE_RATIO:.4f}"
+        ),
+    }
+
+
+def fairness_gate_per_rubric(
+    predictions: pd.DataFrame,
+    rng: np.random.Generator,
+    bootstrap_b: int = BOOTSTRAP_B,
+) -> dict[str, Any]:
+    """Phase 3 multi-task per-rubric fairness gate (Stage 1 WIRE-UP).
+
+    스펙 v1.1.5 § 6 A3 + § 12.4. ACCEPTANCE `mid_multitask.fairness_gate` 4 dim 적용:
+    - exp/org/cont: native 0~3, band low_0_1/mid_1_2/high_2_3
+    - overall: raw 0~30, band low_0_9/mid_10_19/high_20_30 (Phase 2 inheritance)
+
+    Input columns (per model_code group):
+    - y_true_exp, y_pred_exp, y_true_org, y_pred_org, y_true_cont, y_pred_cont (native 0~3)
+    - y_true_overall_raw, y_pred_overall_raw (raw 0~30)
+    - 또는 y_true / y_pred + dim 컬럼 (single-target M1~M4 호환 — overall만 평가)
+
+    Returns dict keyed by model_code → {exp/org/cont/overall: gate_result}.
+    """
+    out: dict[str, Any] = {"by_model": {}}
+    pr_bands = (SCORE_BAND_PR_LOW, SCORE_BAND_PR_MID, SCORE_BAND_PR_HIGH)
+    raw_bands = (SCORE_BAND_LOW, SCORE_BAND_MID, SCORE_BAND_HIGH)
+
+    for model_code, model_df in predictions.groupby("model_code"):
+        per_dim: dict[str, Any] = {}
+        # per-rubric 차원 (native 0~3)
+        for dim in PER_RUBRIC_DIMENSIONS:
+            yt_col = f"y_true_{dim}"
+            yp_col = f"y_pred_{dim}"
+            if yt_col not in model_df.columns or yp_col not in model_df.columns:
+                per_dim[dim] = {"status": "SKIP_MISSING_COLUMN"}
+                continue
+            yt = model_df[yt_col].to_numpy(dtype=float)
+            yp = model_df[yp_col].to_numpy(dtype=float)
+            bands = np.array([score_band_per_rubric(s) for s in yt])
+            per_dim[dim] = _fairness_gate_for_single_dim(
+                yt, yp, bands, pr_bands, rng, bootstrap_b
+            )
+        # overall (raw 0~30, Phase 2 score_band 재사용)
+        if "y_true_overall_raw" in model_df.columns and "y_pred_overall_raw" in model_df.columns:
+            yt = model_df["y_true_overall_raw"].to_numpy(dtype=float)
+            yp = model_df["y_pred_overall_raw"].to_numpy(dtype=float)
+            bands = np.array([score_band(s) for s in yt])
+            per_dim["overall"] = _fairness_gate_for_single_dim(
+                yt, yp, bands, raw_bands, rng, bootstrap_b
+            )
+        elif "y_true" in model_df.columns and "y_pred" in model_df.columns:
+            # single-target M1~M4 호환 — overall로만 평가
+            yt = model_df["y_true"].to_numpy(dtype=float)
+            yp = model_df["y_pred"].to_numpy(dtype=float)
+            bands = (
+                model_df["score_band"].to_numpy()
+                if "score_band" in model_df.columns
+                else np.array([score_band(s) for s in yt])
+            )
+            per_dim["overall"] = _fairness_gate_for_single_dim(
+                yt, yp, bands, raw_bands, rng, bootstrap_b
+            )
+        else:
+            per_dim["overall"] = {"status": "SKIP_MISSING_COLUMN"}
+
+        # 모든 차원 acceptance_pass 합산
+        passes = [
+            v.get("acceptance_pass", False)
+            for v in per_dim.values()
+            if isinstance(v, dict) and "acceptance_pass" in v
+        ]
+        per_dim["all_dimensions_pass"] = bool(passes) and all(passes)
+        out["by_model"][model_code] = per_dim
+
+    out["acceptance_threshold_ratio"] = FAIRNESS_GATE_RATIO
+    out["low_band_min_n"] = SCORE_BAND_LOW_MIN_N
+    out["bootstrap_b"] = bootstrap_b
+    out["per_rubric_cutoffs"] = {
+        "low_0_1": "<=1.0", "mid_1_2": "1.0<x<=2.0", "high_2_3": ">2.0",
+    }
+    out["overall_cutoffs"] = {
+        "low_0_9": "<10", "mid_10_19": "<20", "high_20_30": ">=20",
+    }
+    return out
+
+
+def auto_continue_check(
+    cycle_history: list[dict],
+    current_cycle_idx: int,
+    config: dict | None = None,
+) -> tuple[bool, str]:
+    """ACCEPTANCE `mid_multitask.auto_continue` 조건 평가 (Stage 1 WIRE-UP).
+
+    Args:
+        cycle_history: list of cycle_report dicts (oldest first). 각 dict는 다음 키 가짐:
+            - judgement: str (PASS_CANDIDATE/PASS_FINAL/FAIL_*)
+            - fairness_gate_pass_per_rubric: bool
+            - cost_circuit_breaker: bool (True = breached)
+            - monotone_evolution_violations: int
+            - per_rubric_monotone_regressions: int
+            - evaluator_wire_up_completed: bool
+            - m5_overall_qwk_lower95: float (evolution_progress 평가용)
+        current_cycle_idx: 1-based cycle index (M2=1, M3=2, ...). grace_cycles와 비교.
+        config: ACCEPTANCE `auto_continue` dict (기본값 사용 시 None)
+
+    Returns:
+        (ok, reason): ok=True면 자동 [Continue] 진행 / False면 인간 게이트
+    """
+    cfg = config or {
+        "consecutive_pass_candidate_max": 2,
+        "grace_cycles": 3,
+        "evolution_progress_required": {
+            "metric": "m5_overall_qwk_lower95",
+            "min_improvement_per_cycle": 0.01,
+            "window_cycles": 2,
+        },
+    }
+    if not cycle_history:
+        return False, "no_cycle_history"
+    latest = cycle_history[-1]
+
+    # 7 조건 평가 (스펙 v1.1.5 § 6 A6 + ACCEPTANCE auto_continue.conditions_all_required)
+    if latest.get("judgement") not in ("PASS_CANDIDATE", "PASS_FINAL"):
+        return False, f"judgement={latest.get('judgement')}"
+    if not latest.get("fairness_gate_pass_per_rubric", False):
+        return False, "fairness_gate_per_rubric fail"
+    if latest.get("cost_circuit_breaker", False):
+        return False, "cost_circuit_breaker breached"
+    if latest.get("monotone_evolution_violations", 0) > 0:
+        return False, "monotone_evolution_violations > 0"
+    if latest.get("per_rubric_monotone_regressions", 0) > 0:
+        return False, "per_rubric_monotone_regressions > 0"
+    if not latest.get("evaluator_wire_up_completed", False):
+        return False, "evaluator_wire_up_completed=false"
+
+    # consecutive_pass_candidate_max
+    max_consec = cfg.get("consecutive_pass_candidate_max", 2)
+    consec = 0
+    for h in reversed(cycle_history):
+        if h.get("judgement") == "PASS_CANDIDATE":
+            consec += 1
+        else:
+            break
+    if consec > max_consec:
+        return False, f"consecutive_pass_candidate {consec} > max {max_consec}"
+
+    # evolution_progress_required (grace_cycles 이후만 적용)
+    grace = cfg.get("grace_cycles", 3)
+    if current_cycle_idx > grace:
+        evo = cfg.get("evolution_progress_required", {})
+        metric = evo.get("metric", "m5_overall_qwk_lower95")
+        min_imp = float(evo.get("min_improvement_per_cycle", 0.01))
+        window = int(evo.get("window_cycles", 2))
+        if len(cycle_history) >= window + 1:
+            recent = cycle_history[-(window + 1):]
+            current = recent[-1].get(metric)
+            baseline = recent[0].get(metric)
+            if current is None or baseline is None:
+                return False, f"evolution_progress: missing metric {metric}"
+            improvement = float(current) - float(baseline)
+            required = min_imp * window
+            if improvement < required:
+                return False, (
+                    f"evolution_progress: improvement {improvement:.4f} "
+                    f"< required {required:.4f} (min {min_imp}/cycle × window {window})"
+                )
+
+    return True, "all conditions satisfied"
 
 
 def load_audit_table(path: Path) -> pd.DataFrame:

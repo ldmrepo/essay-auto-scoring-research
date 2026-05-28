@@ -199,14 +199,20 @@ stages:
   # 본 stage 활성화 전까지 pipelines/evaluate.py가 mid_multitask 분기를 인지하지 못함.
   # R2-NF3 fix: _inherits_semantics 제거 (dead documentation). mid_multitask는 self-contained.
   mid_multitask:
-    _implementation_status: not_wired_yet
-    _wire_up_required:
-      - "pipelines/evaluate.py에 mid_multitask 분기 추가 (현재 toy 단일 분기만 존재)"
-      - "차원별 score_band cutoff 함수 추가 (T1-04, score_band_per_rubric)"
-      - "fairness_gate_per_rubric() 함수 + 차원별 lower95 계산"
-      - "auto_continue 조건 evaluator/SYNTH 양측 구현"
-      - "wire-up 완료 후 _implementation_status를 wired_v1로 변경 + Phase 3 M2 SYNTH 검증"
-      - "cycle_preflight.sh [11/12]가 wired_v1 확인 후에만 M3+ 진입 허용 (R2-NF1 fix)"
+    # P3-W4 (2026-05-28): Stage 1 WIRE-UP cycle 완료 → wired_v1 전환.
+    _implementation_status: wired_v1
+    _wired_v1_evidence:
+      - "pipelines/evaluate.py: score_band_per_rubric() + fairness_gate_per_rubric() + auto_continue_check() (3 helper)"
+      - "pipelines/train_transformer.py: rubric_json_col 옵션 → validate_rubric_for_phase3 사전 검증"
+      - "tests/test_evaluate_phase3.py: 18 passed (per-rubric cutoff + fairness 4 dim + auto_continue 11 조건)"
+      - "pipelines/extract_5k.py: --validate-rubric flag + manifest.drift_skipped (Phase 3 명령)"
+      - "cycle_preflight.sh [11/12]: PyYAML 파싱 + ImportError → FAIL + M3+ wired_v1 hard-block"
+    _wire_up_history:
+      - "v0 (Phase 2 종료): not_wired_yet"
+      - "v1 (2026-05-28 Stage 1): wired_v1 — evaluator helper + tests + train_transformer 사전 검증"
+    _wire_up_remaining_for_full_chain:
+      - "SYNTH worker prompt에 cycle_report.json 표준 schema + auto_continue_check 호출 의무 명시 (M2 SYNTH 첫 실행 시 적용)"
+      - "evaluate.py main()에서 mid_multitask stage 진입 시 fairness_gate_per_rubric 호출 branch 추가 (현재는 helper만 export, main 분기는 cycle_report 산출 시점 적용)"
     scope:
       dataset: "dataset/sample_5k/ (Phase 2 inheritance — D4)"
       max_rows: 5003
