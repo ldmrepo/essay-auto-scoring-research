@@ -42,5 +42,13 @@ venv/
 .env.*
 !.env.example
 
+# Large source datasets — AI Hub에서 재다운로드 가능 (수GB 단위)
+dataset/1.Training/
+dataset/2.Validation/
+
 # 5K stratified subsample (43M, deterministic from extract_5k.py seed=42)
 dataset/sample_5k/
+
+# Phase 1 toy sample (342건) + 데이터 설명서 PDF는 추적 유지
+# (dataset/sample/, dataset/*.pdf는 ignore 대상 아님)
+.gstack/
