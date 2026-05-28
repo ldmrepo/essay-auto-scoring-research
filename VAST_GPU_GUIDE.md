@@ -11,10 +11,11 @@ pip install vastai
 
 # API 키는 .env에서 load (절대 git/로그/공유 채널에 노출 금지)
 export VAST_API_KEY=$(grep -E '^VAST_API_KEY=' .env | cut -d= -f2-)
-vastai show user   # 인증 확인
+vastai --api-key "$VAST_API_KEY" show instances --raw   # 인증 확인
 ```
 
 `.env` 템플릿은 `.env.example` 참고. 키 노출 의심 시 즉시 vast.ai 콘솔에서 revoke + regenerate.
+`vastai show user`는 vastai CLI 0.5.0에서 `/api/v0/users/current?owner=me`를 호출해 현재 API schema와 충돌할 수 있다. 인증 확인에는 `show instances --raw` 또는 `search offers --raw`처럼 `owner` 파라미터를 붙이지 않는 읽기 전용 명령을 사용한다. `vastai --explain`은 API key를 평문 출력하므로 사용하지 않는다.
 
 ## 1. GPU 검색 (모델별 권장 조건)
 
@@ -26,7 +27,7 @@ vastai show user   # 인증 확인
 | klue/roberta-large (337M) | 24 GB | `gpu_ram>=24 num_gpus=1 dph<=0.40 reliability>0.95 inet_down>300` |
 
 ```bash
-vastai search offers 'gpu_ram>=8 num_gpus=1 dph<=0.10 reliability>0.95 inet_down>200' \
+vastai --api-key "$VAST_API_KEY" search offers 'gpu_ram>=8 num_gpus=1 dph<=0.10 reliability>0.95 inet_down>200' \
   -o 'dph' --limit 5
 ```
 
@@ -36,7 +37,7 @@ vastai search offers 'gpu_ram>=8 num_gpus=1 dph<=0.10 reliability>0.95 inet_down
 
 ```bash
 OFFER_ID=<위 검색 결과의 id>
-vastai create instance $OFFER_ID \
+vastai --api-key "$VAST_API_KEY" create instance $OFFER_ID \
   --image pytorch/pytorch:2.1.0-cuda12.1-cudnn8-runtime \
   --disk 50 \
   --onstart-cmd "pip install transformers==4.44.* datasets accelerate optuna scikit-learn lightgbm mlflow && echo READY"
@@ -48,8 +49,8 @@ vastai create instance $OFFER_ID \
 
 ```bash
 INSTANCE_ID=<create 시 반환된 id>
-vastai show instance $INSTANCE_ID
-vastai ssh-url $INSTANCE_ID    # ssh://root@sshX.vast.ai:PORT
+vastai --api-key "$VAST_API_KEY" show instance $INSTANCE_ID
+vastai --api-key "$VAST_API_KEY" ssh-url $INSTANCE_ID    # ssh://root@sshX.vast.ai:PORT
 ```
 
 loading → running 전환까지 15~60초. running이 되었어도 onstart-cmd 완료(READY)까지 추가 1~3분.
@@ -79,7 +80,7 @@ HOST=sshX.vast.ai   # ssh-url 결과에서 추출
 PORT=12345          # ssh-url 결과에서 추출
 
 # 종료 시 자동 destroy 보장 (Ctrl-C, 스크립트 실패 모두 cover)
-trap 'echo "destroying $INSTANCE_ID"; vastai destroy instance "$INSTANCE_ID"' EXIT
+trap 'echo "destroying $INSTANCE_ID"; vastai --api-key "$VAST_API_KEY" destroy instance "$INSTANCE_ID"' EXIT
 
 scp -o StrictHostKeyChecking=accept-new -P $PORT \
   -r dataset/sample_5k pipelines configs AGENTS.md \
@@ -117,9 +118,9 @@ scp -P $PORT -r root@$HOST:/workspace/essay/workspace/cycle_M1 ./workspace/
 ## 8. 종료 (trap이 동작했다면 자동 처리됨, 수동 확인)
 
 ```bash
-vastai show instances    # 비어있어야 OK
+vastai --api-key "$VAST_API_KEY" show instances --raw    # 비어있어야 OK
 # 만약 남아있다면
-vastai destroy instance $INSTANCE_ID
+vastai --api-key "$VAST_API_KEY" destroy instance $INSTANCE_ID
 ```
 
 ## 9. 비용 참고 (Phase 2 추정)
@@ -138,7 +139,7 @@ vastai destroy instance $INSTANCE_ID
 - onstart-cmd `READY` echo 15분 초과 → destroy 후 다른 offer
 - 한글 파일명 SCP 간헐 실패 → 재시도 또는 zip 후 전송
 - **반드시 `vastai destroy` 또는 trap으로 정리** (과금 방지)
-- `vastai show instances`로 잔존 인스턴스 0건 정기 확인
+- `vastai --api-key "$VAST_API_KEY" show instances --raw`로 잔존 인스턴스 0건 정기 확인
 - **Hard Rule #2: 학생 PII 외부 LLM/compute 전송 금지** — §4 audit gate 절대 생략 금지
 - API 키는 `.env`만, git/echo/로그/스크린샷 노출 금지
 
@@ -154,21 +155,24 @@ export VAST_API_KEY=$(grep -E '^VAST_API_KEY=' .env | cut -d= -f2-)
 python3 -m pipelines.audit_pii dataset/sample_5k \
   --report workspace/pii_audit_pre_upload.json --fail-on-hit || exit 1
 
-# 2. 검색 + 생성
-OFFER_ID=$(vastai search offers 'gpu_ram>=8 num_gpus=1 dph<=0.10 reliability>0.95' -o 'dph' --raw \
+# 2. 인증 확인
+vastai --api-key "$VAST_API_KEY" show instances --raw >/dev/null
+
+# 3. 검색 + 생성
+OFFER_ID=$(vastai --api-key "$VAST_API_KEY" search offers 'gpu_ram>=8 num_gpus=1 dph<=0.10 reliability>0.95' -o 'dph' --raw \
            | python3 -c "import sys,json; print(json.load(sys.stdin)[0]['id'])")
-INSTANCE_ID=$(vastai create instance $OFFER_ID \
+INSTANCE_ID=$(vastai --api-key "$VAST_API_KEY" create instance $OFFER_ID \
   --image pytorch/pytorch:2.1.0-cuda12.1-cudnn8-runtime --disk 50 \
   --onstart-cmd "pip install transformers==4.44.* datasets accelerate optuna scikit-learn lightgbm mlflow && echo READY" \
   --raw | python3 -c "import sys,json; print(json.load(sys.stdin)['new_contract'])")
-trap 'echo "destroying $INSTANCE_ID"; vastai destroy instance "$INSTANCE_ID"' EXIT
+trap 'echo "destroying $INSTANCE_ID"; vastai --api-key "$VAST_API_KEY" destroy instance "$INSTANCE_ID"' EXIT
 
-# 3. URL 대기
-sleep 90 && SSH_URL=$(vastai ssh-url $INSTANCE_ID)
+# 4. URL 대기
+sleep 90 && SSH_URL=$(vastai --api-key "$VAST_API_KEY" ssh-url $INSTANCE_ID)
 HOST=$(echo $SSH_URL | sed -E 's|ssh://root@([^:]+):.*|\1|')
 PORT=$(echo $SSH_URL | sed -E 's|.*:([0-9]+)$|\1|')
 
-# 4. 업로드 + 실행 + 회수
+# 5. 업로드 + 실행 + 회수
 scp -o StrictHostKeyChecking=accept-new -P $PORT -r \
   dataset/sample_5k pipelines configs AGENTS.md root@$HOST:/workspace/essay/
 ssh -o StrictHostKeyChecking=accept-new -p $PORT root@$HOST \
@@ -177,5 +181,5 @@ ssh -o StrictHostKeyChecking=accept-new -p $PORT root@$HOST \
 scp -P $PORT root@$HOST:/workspace/essay/mlflow.db ./mlflow_remote_M1.db
 scp -P $PORT -r root@$HOST:/workspace/essay/workspace/cycle_M1 ./workspace/
 
-# 5. trap이 destroy 호출
+# 6. trap이 destroy 호출
 ```

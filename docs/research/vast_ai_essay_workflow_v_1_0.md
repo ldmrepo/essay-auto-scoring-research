@@ -78,7 +78,7 @@ mlflow_remote_M1.db, workspace/cycle_M1/
 ## 6. 다음 액션 (Phase 2 setup 시점)
 
 - [ ] vast.ai 콘솔에서 신규 API 키 발급, 기존 키 revoke
-- [ ] `.env`에 신규 키 저장, `vastai show user` 인증 확인
+- [ ] `.env`에 신규 키 저장, `vastai --api-key "$VAST_API_KEY" show instances --raw` 인증 확인 (`vastai show user`는 CLI 0.5.0/API schema 호환성 문제로 사용 금지)
 - [ ] `dataset/sample_5k/` 추출 (Phase 2 design 문서 §B2 데이터 출처 결정 후)
 - [ ] `pipelines.audit_pii dataset/sample_5k --fail-on-hit` PASS 확인
 - [ ] `VAST_GPU_GUIDE.md` §11 빠른 참조 그대로 1회 dry-run
