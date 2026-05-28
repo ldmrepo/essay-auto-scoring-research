@@ -121,7 +121,19 @@ def parse_args() -> argparse.Namespace:
         "--hpo-trials",
         type=int,
         default=0,
-        help="Optuna HPO trials count (0 = no HPO, use defaults).",
+        help=(
+            "Deprecated in train.py. HPO runs in pipelines.run_hpo. "
+            "Use --hparams-json to inject HPO best_params into final training."
+        ),
+    )
+    parser.add_argument(
+        "--hparams-json",
+        default=None,
+        help=(
+            "Optional path to a JSON file containing HPO best_params for the "
+            "trained model. Falls back to MODEL_SPECS default_hparams/params if "
+            "absent. Expected schema: {\"best_params\": {...}} or {...} directly."
+        ),
     )
     parser.add_argument(
         "--models",
@@ -130,6 +142,23 @@ def parse_args() -> argparse.Namespace:
         help="Subset of model IDs to train. Accepts space-separated or comma-separated IDs.",
     )
     return parser.parse_args()
+
+
+def load_hparams_override(path: str | None) -> dict[str, Any] | None:
+    """Load HPO best_params from a JSON file.
+
+    Accepts either a top-level dict (treated as hparams directly) or a dict
+    with a "best_params" key (matches pipelines.run_hpo study_summary output).
+    Returns None when path is None or empty.
+    """
+    if not path:
+        return None
+    payload = load_json(Path(path))
+    if isinstance(payload, dict) and "best_params" in payload:
+        return dict(payload["best_params"])
+    if isinstance(payload, dict):
+        return dict(payload)
+    raise ValueError(f"hparams JSON at {path} must be a dict, got {type(payload).__name__}")
 
 
 def normalize_model_ids(model_args: list[str]) -> list[str]:
@@ -476,6 +505,7 @@ def train_model(
     per_fold_metrics: list[dict[str, Any]] = []
     all_valid_predictions: list[pd.DataFrame] = []
     run_ids: dict[str, str] = {}
+    hparams_override = load_hparams_override(getattr(args, "hparams_json", None))
 
     for fold in folds:
         matrix, labels, row_manifest = load_fold_data(
@@ -486,7 +516,8 @@ def train_model(
         y_train = labels.loc[train_mask, TARGET_NAME].to_numpy(dtype=float)
         y_valid = labels.loc[valid_mask, TARGET_NAME].to_numpy(dtype=float)
         selected = select_features(model_id, matrix, row_manifest)
-        estimator = build_estimator(model_id, args.seed)
+        # build_estimator ignores hparams for M1-M3; only M4 honours the override.
+        estimator = build_estimator(model_id, args.seed, hparams=hparams_override)
 
         start = time.perf_counter()
         if selected is None:
@@ -669,6 +700,9 @@ def train_transformer_model(
     all_valid_predictions: list[pd.DataFrame] = []
     run_ids: dict[str, str] = {}
     hparams = dict(MODEL_SPECS[model_id]["default_hparams"])
+    override = load_hparams_override(getattr(args, "hparams_json", None))
+    if override:
+        hparams.update(override)
 
     for fold in folds:
         _, labels, _ = load_fold_data(
