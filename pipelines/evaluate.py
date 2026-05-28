@@ -19,12 +19,19 @@ import yaml
 from sklearn.metrics import cohen_kappa_score, mean_absolute_error, mean_squared_error
 
 
-MODEL_CODES = ["M1", "M2", "M3", "M4"]
+DEFAULT_MODEL_CODES = ["M1", "M2", "M3", "M4", "M5", "M6"]
 SCORE_MIN = 0
 SCORE_MAX = 30
 BOOTSTRAP_B = 1000
-TASK_ID = "t_21aadeeb"
-DEFAULT_FEATURE_PROVENANCE = "workspace/cycle_2/features/feature_provenance_manifest.json"
+TASK_ID = "t_1bab6d23"
+DEFAULT_FEATURE_PROVENANCE = "workspace/cycle_M1/features/feature_provenance_manifest.json"
+
+# Hard Rule #14 (2026-05-28 신설): Score-Band Fairness Gate
+SCORE_BAND_LOW = "low_0_9"
+SCORE_BAND_MID = "mid_10_19"
+SCORE_BAND_HIGH = "high_20_30"
+SCORE_BAND_LOW_MIN_N = 10
+FAIRNESS_GATE_RATIO = 0.7
 
 
 def parse_args() -> argparse.Namespace:
@@ -32,17 +39,29 @@ def parse_args() -> argparse.Namespace:
         description="Build evaluation reports from out-of-fold model predictions."
     )
     parser.add_argument("--run-id", action="append", default=[], help="Reference MLflow run id(s) to verify against prediction artifacts.")
-    parser.add_argument("--models-dir", default="workspace/cycle_2/models")
-    parser.add_argument("--audit-table", default="workspace/cycle_2/audit/audit_table_no_raw_text.csv")
-    parser.add_argument("--split-dir", default="workspace/cycle_2/splits")
+    parser.add_argument("--models-dir", default="workspace/cycle_M1/models")
+    parser.add_argument("--audit-table", default="workspace/cycle_M1/audit/audit_table_no_raw_text.csv")
+    parser.add_argument("--split-dir", default="workspace/cycle_M1/splits")
     parser.add_argument("--feature-provenance", default=DEFAULT_FEATURE_PROVENANCE)
     parser.add_argument("--acceptance-criteria", default="ACCEPTANCE_CRITERIA.yaml")
     parser.add_argument("--board-config", default="configs/board_config.yaml")
-    parser.add_argument("--output-dir", default="workspace/cycle_2/eval")
-    parser.add_argument("--cycle-id", type=int, default=2)
+    parser.add_argument("--output-dir", default="workspace/cycle_M1/eval")
+    parser.add_argument("--cycle-id", default="M1", help="Cycle id, e.g. '1' (Phase 1) or 'M1' (Phase 2).")
     parser.add_argument("--kanban-task-id", default=TASK_ID)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--bootstrap-b", type=int, default=BOOTSTRAP_B)
+    parser.add_argument(
+        "--models",
+        nargs="+",
+        default=DEFAULT_MODEL_CODES,
+        help="Subset of model codes to evaluate. Default: M1..M6.",
+    )
+    parser.add_argument(
+        "--expected-n",
+        type=int,
+        default=None,
+        help="Optional expected total valid prediction count. Default: skip count check.",
+    )
     return parser.parse_args()
 
 
@@ -192,11 +211,18 @@ def bootstrap_human_ceiling(
 
 
 def score_band(score: float) -> str:
+    """Hard Rule #14 (Score-Band Fairness Gate, 2026-05-28 신설) 정의.
+
+    Phase 2 데이터셋 분포에 맞춰 0-30 점수를 3개 band로 분할:
+      low_0_9: 0 <= score < 10
+      mid_10_19: 10 <= score < 20
+      high_20_30: 20 <= score <= 30
+    """
+    if score < 10:
+        return SCORE_BAND_LOW
     if score < 20:
-        return "low_0_20"
-    if score < 25:
-        return "mid_20_25"
-    return "high_25_30"
+        return SCORE_BAND_MID
+    return SCORE_BAND_HIGH
 
 
 def load_audit_table(path: Path) -> pd.DataFrame:
@@ -221,7 +247,12 @@ def load_audit_table(path: Path) -> pd.DataFrame:
     return df
 
 
-def load_predictions(models_dir: Path, audit_df: pd.DataFrame) -> pd.DataFrame:
+def load_predictions(
+    models_dir: Path,
+    audit_df: pd.DataFrame,
+    model_codes: list[str],
+    expected_n: int | None = None,
+) -> pd.DataFrame:
     metadata = audit_df[
         [
             "relative_path",
@@ -236,7 +267,7 @@ def load_predictions(models_dir: Path, audit_df: pd.DataFrame) -> pd.DataFrame:
         ]
     ]
     frames = []
-    for model_code in MODEL_CODES:
+    for model_code in model_codes:
         path = models_dir / model_code / "predictions.csv"
         if not path.exists():
             raise FileNotFoundError(path)
@@ -254,8 +285,10 @@ def load_predictions(models_dir: Path, audit_df: pd.DataFrame) -> pd.DataFrame:
         missing = sorted({"model_code", "fold", "relative_path", "y_true", "y_pred"} - set(df.columns))
         if missing:
             raise ValueError(f"{path} missing required columns after normalization: {missing}")
-        if len(df) != 342:
-            raise ValueError(f"{path} should contain 342 out-of-fold valid predictions, got {len(df)}")
+        if expected_n is not None and len(df) != expected_n:
+            raise ValueError(
+                f"{path} should contain {expected_n} out-of-fold valid predictions, got {len(df)}"
+            )
         if df["relative_path"].duplicated().any():
             raise ValueError(f"{path} has duplicate valid relative_path rows")
         metadata_columns = [
@@ -314,9 +347,109 @@ def build_segment_metrics(
     return pd.DataFrame(rows)
 
 
-def load_training_warnings(models_dir: Path) -> dict[str, Any]:
+def fairness_gate(
+    predictions: pd.DataFrame, rng: np.random.Generator, bootstrap_b: int = BOOTSTRAP_B
+) -> dict[str, Any]:
+    """Hard Rule #14 (Score-Band Fairness Gate, 2026-05-28 신설) 측정.
+
+    Per-band QWK + macro-QWK (per-band simple unweighted mean, majority 편향 방지)
+    + worst-band QWK (low band N<10이면 SKIP_UNSTABLE) + acceptance hard-block
+    (worst_band_qwk >= macro_qwk * FAIRNESS_GATE_RATIO).
+    """
+    out: dict[str, Any] = {"by_model": {}}
+    bands = [SCORE_BAND_LOW, SCORE_BAND_MID, SCORE_BAND_HIGH]
+    for model_code, model_df in predictions.groupby("model_code"):
+        per_band: dict[str, dict[str, Any]] = {}
+        for band in bands:
+            band_df = model_df[model_df["score_band"] == band]
+            n = int(len(band_df))
+            if n == 0:
+                per_band[band] = {"n": 0, "qwk": None, "status": "EMPTY"}
+                continue
+            qwk_val = qwk_score(
+                band_df["y_true"].to_numpy(dtype=float),
+                band_df["y_pred"].to_numpy(dtype=float),
+            )
+            ci = bootstrap_ci(
+                band_df["y_true"].to_numpy(dtype=float),
+                band_df["y_pred"].to_numpy(dtype=float),
+                qwk_score,
+                rng,
+                bootstrap_b,
+            )
+            per_band[band] = {
+                "n": n,
+                "qwk": float(qwk_val),
+                "qwk_lower95": ci["lower95"],
+                "qwk_upper95": ci["upper95"],
+                "status": "OK",
+            }
+
+        # macro_qwk: simple unweighted mean of bands with sufficient samples
+        eligible = [
+            (b, per_band[b])
+            for b in bands
+            if per_band[b]["status"] == "OK"
+            and (b != SCORE_BAND_LOW or per_band[b]["n"] >= SCORE_BAND_LOW_MIN_N)
+        ]
+        unstable_low = (
+            per_band[SCORE_BAND_LOW]["status"] == "OK"
+            and per_band[SCORE_BAND_LOW]["n"] < SCORE_BAND_LOW_MIN_N
+        )
+
+        if not eligible:
+            out["by_model"][model_code] = {
+                "per_band": per_band,
+                "macro_qwk": None,
+                "worst_band_qwk": None,
+                "worst_band_name": None,
+                "low_band_status": "SKIP_UNSTABLE" if unstable_low else "MISSING",
+                "acceptance_pass": False,
+                "acceptance_reason": "no_eligible_bands",
+            }
+            continue
+
+        macro_qwk = float(np.mean([entry["qwk"] for _, entry in eligible]))
+        # Worst-band QWK = min over mid/high only (low excluded if N<10)
+        mid_high = [
+            (b, entry)
+            for b, entry in eligible
+            if b in {SCORE_BAND_MID, SCORE_BAND_HIGH}
+        ]
+        if mid_high:
+            worst_b, worst_entry = min(mid_high, key=lambda kv: kv[1]["qwk"])
+            worst_band_qwk = float(worst_entry["qwk"])
+            worst_band_name = worst_b
+        else:
+            worst_b, worst_entry = min(eligible, key=lambda kv: kv[1]["qwk"])
+            worst_band_qwk = float(worst_entry["qwk"])
+            worst_band_name = worst_b
+
+        acceptance_pass = worst_band_qwk >= macro_qwk * FAIRNESS_GATE_RATIO
+        out["by_model"][model_code] = {
+            "per_band": per_band,
+            "macro_qwk": macro_qwk,
+            "worst_band_qwk": worst_band_qwk,
+            "worst_band_name": worst_band_name,
+            "low_band_status": "SKIP_UNSTABLE" if unstable_low else "OK",
+            "acceptance_threshold": macro_qwk * FAIRNESS_GATE_RATIO,
+            "acceptance_pass": bool(acceptance_pass),
+            "acceptance_reason": (
+                f"worst_band_qwk={worst_band_qwk:.4f} "
+                f"{'>=' if acceptance_pass else '<'} "
+                f"macro_qwk * {FAIRNESS_GATE_RATIO} = "
+                f"{macro_qwk * FAIRNESS_GATE_RATIO:.4f}"
+            ),
+        }
+    out["acceptance_threshold_ratio"] = FAIRNESS_GATE_RATIO
+    out["low_band_min_n"] = SCORE_BAND_LOW_MIN_N
+    out["bootstrap_b"] = bootstrap_b
+    return out
+
+
+def load_training_warnings(models_dir: Path, model_codes: list[str]) -> dict[str, Any]:
     warnings: dict[str, Any] = {}
-    for model_code in MODEL_CODES:
+    for model_code in model_codes:
         path = models_dir / model_code / "metrics_per_fold.json"
         if not path.exists():
             continue
@@ -574,7 +707,9 @@ def main() -> int:
     board_config_path = Path(args.board_config)
 
     audit_df = load_audit_table(audit_path)
-    predictions = load_predictions(models_dir, audit_df)
+    predictions = load_predictions(
+        models_dir, audit_df, model_codes=args.models, expected_n=args.expected_n
+    )
     prediction_run_ids = collect_prediction_run_ids(predictions)
     verify_reference_run_ids(args.run_id, prediction_run_ids)
     criteria = load_yaml(acceptance_path)
@@ -595,14 +730,20 @@ def main() -> int:
         args.bootstrap_b,
     )
     acceptance = evaluate_acceptance(overall_rows, ceiling, criteria)
-    training_warnings = load_training_warnings(models_dir)
+    training_warnings = load_training_warnings(models_dir, args.models)
+
+    # Hard Rule #14 (Score-Band Fairness Gate, 2026-05-28 신설)
+    fairness_rng = np.random.default_rng(args.seed + 20_000)
+    fairness = fairness_gate(predictions, fairness_rng, args.bootstrap_b)
 
     segment_metrics_path = output_dir / "segment_metrics.csv"
     eval_report_path = output_dir / "eval_report.md"
     ceiling_report_path = output_dir / "ceiling_comparison.md"
+    fairness_gate_path = output_dir / "fairness_gate.json"
     manifest_path = output_dir / "eval_manifest.json"
 
     segment_df.to_csv(segment_metrics_path, index=False)
+    write_json(fairness_gate_path, fairness)
     build_eval_report(eval_report_path, segment_df, acceptance, training_warnings, args.cycle_id)
     build_ceiling_report(ceiling_report_path, ceiling, overall_rows, acceptance, args.cycle_id)
 
