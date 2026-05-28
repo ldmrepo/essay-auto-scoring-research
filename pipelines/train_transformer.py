@@ -108,11 +108,19 @@ def train_transformer(
     )
     trainer.train()
 
-    # Predict on valid
+    # Predict on train/valid for the same train-vs-valid diagnostics used by
+    # the CPU baselines.
+    train_output = trainer.predict(train_ds)
+    train_predictions = np.asarray(train_output.predictions).squeeze(-1)
+    train_labels = np.asarray([train_ds[i]["labels"].item() for i in range(len(train_ds))])
+
     valid_output = trainer.predict(valid_ds)
     valid_predictions = np.asarray(valid_output.predictions).squeeze(-1)
     valid_labels = np.asarray([valid_ds[i]["labels"].item() for i in range(len(valid_ds))])
 
+    train_mae = float(mean_absolute_error(train_labels, train_predictions))
+    train_rmse = float(np.sqrt(mean_squared_error(train_labels, train_predictions)))
+    train_loss = float(np.mean((train_predictions - train_labels) ** 2))
     valid_mae = float(mean_absolute_error(valid_labels, valid_predictions))
     valid_rmse = float(np.sqrt(mean_squared_error(valid_labels, valid_predictions)))
     valid_loss = float(np.mean((valid_predictions - valid_labels) ** 2))
@@ -122,6 +130,10 @@ def train_transformer(
     trainer.save_model(str(model_path))
 
     return {
+        "train_loss": train_loss,
+        "train_mae": train_mae,
+        "train_rmse": train_rmse,
+        "train_predictions": train_predictions,
         "valid_loss": valid_loss,
         "valid_mae": valid_mae,
         "valid_rmse": valid_rmse,

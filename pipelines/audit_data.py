@@ -42,10 +42,10 @@ LABEL_SIDE_FIELDS = [
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run toy data quality and leakage audit.")
+    parser = argparse.ArgumentParser(description="Run essay data quality and leakage audit.")
     parser.add_argument("--input", default="dataset/sample", help="Sample dataset root.")
     parser.add_argument("--output-dir", default="workspace/cycle_2/audit")
-    parser.add_argument("--cycle-id", type=int, default=2)
+    parser.add_argument("--cycle-id", default="2")
     parser.add_argument("--kanban-task-id", default="t_2cf26996")
     return parser.parse_args()
 
@@ -181,6 +181,89 @@ def collect_rows(source_root: Path, label_root: Path) -> tuple[pd.DataFrame, dic
         "duplicate_source_ids": duplicate_source_ids,
         "duplicate_label_ids": duplicate_label_ids,
         "duplicate_source_hashes": duplicate_source_hashes,
+    }
+    return df, extras
+
+
+def collect_label_only_rows(label_root: Path) -> tuple[pd.DataFrame, dict[str, Any]]:
+    label_paths = json_paths(label_root)
+    rows: list[dict[str, Any]] = []
+    label_ids: list[str] = []
+    paragraph_hashes: list[str] = []
+    label_hashes: list[str] = []
+
+    for relative_path, label_path in label_paths.items():
+        label = load_json(label_path)
+        essay_id = label.get("info", {}).get("essay_id")
+        if essay_id:
+            label_ids.append(str(essay_id))
+
+        paragraph = label.get("paragraph", [])
+        paragraph_texts = [
+            item.get("paragraph_txt", "")
+            for item in paragraph
+            if isinstance(item, dict) and isinstance(item.get("paragraph_txt"), str)
+        ] if isinstance(paragraph, list) else []
+        paragraph_text_joined = "\n".join(paragraph_texts)
+        paragraph_sha = sha256_text(paragraph_text_joined) if paragraph_text_joined else ""
+        if paragraph_sha:
+            paragraph_hashes.append(paragraph_sha)
+
+        label_sha = sha256_file(label_path)
+        label_hashes.append(label_sha)
+
+        score = label.get("score", {})
+        essay_scores = score.get("essay_scoreT", [])
+        if not isinstance(essay_scores, list):
+            essay_scores = []
+        student = label.get("student", {})
+        info = label.get("info", {})
+        correction = label.get("correction", [])
+        org_keys, org_sum = get_weight_summary(label, "organization_weight")
+        con_keys, con_sum = get_weight_summary(label, "content_weight")
+        exp_keys, exp_sum = get_weight_summary(label, "expression_weight")
+
+        rows.append(
+            {
+                "relative_path": relative_path,
+                "has_label": True,
+                "essay_id_label": essay_id,
+                "essay_type": info.get("essay_type") or label.get("rubric", {}).get("essay_type"),
+                "student_grade": student.get("student_grade"),
+                "student_grade_group": student.get("student_grade_group"),
+                "student_location": student.get("location"),
+                "student_date": student.get("date"),
+                "target_essay_scoreT_avg": score.get("essay_scoreT_avg"),
+                "paragraph_txt_present": bool(paragraph_text_joined.strip()),
+                "paragraph_txt_chars": len(paragraph_text_joined),
+                "sentence_sep_count": paragraph_text_joined.count(SENTENCE_SEPARATOR),
+                "paragraph_text_sha256": paragraph_sha,
+                "essay_level": info.get("essay_level"),
+                "essay_len_label": info.get("essay_len"),
+                "essay_prompt_present": "essay_prompt" in info,
+                "student_educated": student.get("student_educated"),
+                "student_reading": student.get("student_reading"),
+                "rater_1": essay_scores[0] if len(essay_scores) > 0 else None,
+                "rater_2": essay_scores[1] if len(essay_scores) > 1 else None,
+                "rater_3": essay_scores[2] if len(essay_scores) > 2 else None,
+                "paragraph_count_label_side": len(paragraph) if isinstance(paragraph, list) else 0,
+                "correction_count_label_side": len(correction) if isinstance(correction, list) else 0,
+                "label_sha256": label_sha,
+                "organization_weight_keys": org_keys,
+                "organization_weight_sum": org_sum,
+                "content_weight_keys": con_keys,
+                "content_weight_sum": con_sum,
+                "expression_weight_keys": exp_keys,
+                "expression_weight_sum": exp_sum,
+            }
+        )
+
+    df = pd.DataFrame(rows)
+    extras = {
+        "label_json_files": len(label_paths),
+        "duplicate_label_ids": duplicate_count(label_ids),
+        "duplicate_paragraph_text_hashes": duplicate_count(paragraph_hashes),
+        "duplicate_label_hashes": duplicate_count(label_hashes),
     }
     return df, extras
 
@@ -447,6 +530,302 @@ Location x student_grade_group:
 """
 
 
+def label_only_audit_report(
+    df: pd.DataFrame,
+    manifest: dict[str, Any] | None,
+    summary: dict[str, Any],
+    imbalance_checks: dict[str, Any],
+    leakage: dict[str, Any],
+    paths: dict[str, str],
+    input_root: Path,
+    label_root: Path,
+    cycle_id: str,
+) -> str:
+    dtype_rows = [
+        {
+            "column": column,
+            "dtype": str(df[column].dtype),
+            "non_null": int(df[column].notna().sum()),
+            "nulls": int(df[column].isna().sum()),
+        }
+        for column in df.columns
+    ]
+    target = pd.to_numeric(df["target_essay_scoreT_avg"], errors="coerce")
+    score_band_df = (
+        target.dropna().round().astype(int).value_counts().sort_index()
+        .rename_axis("score_band")
+        .reset_index(name="count")
+    )
+    target_summary_df = pd.DataFrame([target_summary(df["target_essay_scoreT_avg"])])
+
+    warnings = []
+    for name, check in imbalance_checks.items():
+        if check["ratio"] > 5:
+            warnings.append(
+                f"- WARN: `{name}` max/min ratio {check['ratio']:.2f} (>5). Counts: {check['counts']}"
+            )
+    warning_text = "\n".join(warnings) if warnings else "- No imbalance ratios >5x."
+    manifest_text = "- Manifest was not found."
+    if manifest is not None:
+        manifest_text = "\n".join(
+            [
+                f"- manifest.actual_n: {manifest.get('actual_n')}",
+                f"- manifest.files: {len(manifest.get('files', []))}",
+                f"- manifest.seed: {manifest.get('seed')}",
+                f"- manifest.by_stratum entries: {len(manifest.get('by_stratum', {}))}",
+                f"- manifest/path count match: {leakage['manifest_consistency']['path_count_matches_manifest']}",
+                f"- missing manifest files: {leakage['manifest_consistency']['missing_manifest_files']}",
+                f"- extra label files: {leakage['manifest_consistency']['extra_label_files']}",
+            ]
+        )
+
+    return f"""# Cycle {cycle_id} Data Audit
+## Scope
+- Input root: `{input_root.as_posix()}/`
+- Label root: `{label_root.as_posix()}/`
+- Layout: Phase 2 label-only sample. Model-visible essay text is stored in `paragraph[].paragraph_txt`.
+- Raw essay text, prompts, paragraphs, and correction text were not copied into audit artifacts.
+- Milestone v2 goal anchor was reinjected by the kanban task body; SHA256 is recorded in `audit_manifest.json`.
+
+## Manifest Sanity
+{manifest_text}
+
+## Shape
+{markdown_table(pd.DataFrame([summary]))}
+
+## Dtypes And Missingness
+{markdown_table(pd.DataFrame(dtype_rows))}
+
+## Duplicate And ID Checks
+- Duplicate essay IDs: {leakage["id_duplicates"]["duplicate_label_ids"]}
+- Duplicate paragraph text hashes: {leakage["id_duplicates"]["duplicate_paragraph_text_hashes"]}
+- Duplicate full label hashes: {leakage["id_duplicates"]["duplicate_label_hashes"]}
+- Missing essay IDs: {leakage["id_duplicates"]["missing_essay_ids"]}
+
+## Type / Grade / Location Distribution
+### Essay Type
+{markdown_table(count_table(df["essay_type"], "essay_type"))}
+
+### Student Grade Group
+{markdown_table(count_table(df["student_grade_group"], "student_grade_group"))}
+
+### Student Grade
+{markdown_table(count_table(df["student_grade"], "student_grade"))}
+
+### Location Group
+{markdown_table(count_table(df["student_location"], "student_location"))}
+
+## Target Distribution
+{markdown_table(target_summary_df)}
+
+### Rounded Score Bands
+{markdown_table(score_band_df)}
+
+## Leakage Checks
+- ID duplicate leakage: {leakage["verdicts"]["id_duplicate_leakage"]}
+- Time leakage: {leakage["verdicts"]["time_leakage"]}
+- Target leakage: {leakage["verdicts"]["target_leakage"]}
+- Group leakage readiness: {leakage["verdicts"]["group_leakage"]}
+- Label-side feature hard-block inventory: {", ".join(LABEL_SIDE_FIELDS)}
+- Model-safe inputs at this stage: `paragraph[].paragraph_txt`, `student.student_grade`
+- Split-only key: `student.location`
+
+## Imbalance Checks (>5x)
+{warning_text}
+
+Label/location imbalance above 5x is expected in this sampled training set and must be handled by stratified group split reporting plus segment metrics. Do not resample validation folds.
+
+## Generated Files
+- `{paths["audit_report"]}`
+- `{paths["leakage_check"]}`
+- `{paths["pii_audit"]}`
+- `{paths["target_distribution"]}`
+- `{paths["audit_manifest"]}`
+- `{paths["audit_table_no_raw_text"]}`
+
+## Verification Commands
+```bash
+python3 pipelines/audit_data.py --input {input_root.as_posix()} --output-dir {Path(paths["audit_report"]).parent.as_posix()} --cycle-id {cycle_id} --kanban-task-id {summary["task_id"]}
+python3 -m pipelines.audit_pii {input_root.as_posix()} --report {paths["pii_audit"]} --fail-on-hit
+```
+"""
+
+
+def run_label_only_audit(args: argparse.Namespace, input_root: Path, label_root: Path) -> None:
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    df, extras = collect_label_only_rows(label_root)
+    target = pd.to_numeric(df["target_essay_scoreT_avg"], errors="coerce")
+    manifest_path = input_root / "manifest.json"
+    manifest = load_json(manifest_path) if manifest_path.exists() else None
+    manifest_files = set(manifest.get("files", [])) if isinstance(manifest, dict) else set()
+    label_files = set(f"라벨링데이터/{path}" for path in df["relative_path"].astype(str))
+    # Some sample directories already store relative paths below the label root.
+    label_files_alt = set(df["relative_path"].astype(str))
+    missing_manifest_files = sorted(manifest_files - label_files - label_files_alt)
+    extra_label_files = sorted((label_files | label_files_alt) - manifest_files)
+    if manifest_files:
+        # Do not double-count the alternate path representation in the report.
+        extra_label_files = sorted(
+            item for item in label_files if item not in manifest_files
+        )
+
+    summary = {
+        "task_id": args.kanban_task_id,
+        "rows": int(df.shape[0]),
+        "label_json_files": extras["label_json_files"],
+        "manifest_actual_n": manifest.get("actual_n") if isinstance(manifest, dict) else None,
+        "manifest_files": len(manifest_files),
+        "target_non_null": int(target.notna().sum()),
+        "target_min": float(target.min()),
+        "target_max": float(target.max()),
+        "target_mean": float(target.mean()),
+        "target_std": float(target.std()),
+        "unique_essay_ids": int(df["essay_id_label"].nunique(dropna=True)),
+        "unique_locations": int(df["student_location"].nunique(dropna=True)),
+        "max_location_group_size": int(df["student_location"].value_counts().max()),
+        "unique_type_grade_level_strata": int(
+            df[["essay_type", "student_grade_group", "essay_level"]].drop_duplicates().shape[0]
+        ),
+    }
+    imbalance_checks = {
+        "essay_type": imbalance(df["essay_type"]),
+        "student_grade": imbalance(df["student_grade"]),
+        "student_grade_group": imbalance(df["student_grade_group"]),
+        "student_location": imbalance(df["student_location"]),
+        "essay_level": imbalance(df["essay_level"]),
+    }
+    leakage = {
+        "cycle_id": args.cycle_id,
+        "task_id": args.kanban_task_id,
+        "id_duplicates": {
+            "duplicate_label_ids": extras["duplicate_label_ids"],
+            "duplicate_paragraph_text_hashes": extras["duplicate_paragraph_text_hashes"],
+            "duplicate_label_hashes": extras["duplicate_label_hashes"],
+            "missing_essay_ids": int(df["essay_id_label"].isna().sum()),
+        },
+        "time_leakage": {
+            "student_date_present": int(df["student_date"].notna().sum()),
+            "policy": "student.date is label-side metadata and is blocked from model features.",
+            "top_dates": {
+                str(k): int(v)
+                for k, v in df["student_date"].fillna("<MISSING>").value_counts().head(20).items()
+            },
+        },
+        "target_leakage": {
+            "label_side_fields": LABEL_SIDE_FIELDS,
+            "policy": "score, rater, paragraph/correction counts, rubric weights, prompt, location/date/reading are not model features.",
+        },
+        "group_leakage": {
+            "group_key": "student.location",
+            "unique_groups": summary["unique_locations"],
+            "max_group_size": summary["max_location_group_size"],
+            "policy": "SPLIT must ensure no location appears in both train and valid for a fold.",
+            "location_counts": {
+                str(k): int(v)
+                for k, v in df["student_location"].fillna("<MISSING>").value_counts().items()
+            },
+        },
+        "manifest_consistency": {
+            "manifest_path": manifest_path.as_posix(),
+            "manifest_actual_n": summary["manifest_actual_n"],
+            "manifest_files": summary["manifest_files"],
+            "label_json_files": extras["label_json_files"],
+            "path_count_matches_manifest": bool(
+                manifest is not None
+                and manifest.get("actual_n") == extras["label_json_files"]
+                and len(manifest_files) == extras["label_json_files"]
+            ),
+            "missing_manifest_files": len(missing_manifest_files),
+            "extra_label_files": len(extra_label_files),
+            "missing_manifest_file_examples": missing_manifest_files[:20],
+            "extra_label_file_examples": extra_label_files[:20],
+        },
+        "feature_provenance_policy": {
+            "model_allowed": ["paragraph[].paragraph_txt", "student.student_grade"],
+            "split_only": ["student.location"],
+            "label_side_hard_block": LABEL_SIDE_FIELDS,
+        },
+        "verdicts": {
+            "id_duplicate_leakage": "PASS" if extras["duplicate_label_ids"] == 0 else "BLOCK",
+            "time_leakage": "PASS_WITH_BLOCKED_FIELD_INVENTORY",
+            "target_leakage": "PASS_WITH_LABEL_SIDE_BLOCKLIST",
+            "group_leakage": "PASS_FOR_AUDIT__REVERIFY_IN_SPLIT",
+        },
+    }
+    errors = []
+    if extras["duplicate_label_ids"]:
+        errors.append("duplicate essay IDs detected")
+    if int(df["essay_id_label"].isna().sum()):
+        errors.append("missing essay IDs detected")
+    if manifest is None:
+        errors.append("manifest.json missing")
+    elif not leakage["manifest_consistency"]["path_count_matches_manifest"]:
+        errors.append("manifest count does not match label JSON count")
+    if int(target.notna().sum()) != int(df.shape[0]):
+        errors.append("missing target_essay_scoreT_avg detected")
+
+    paths = {
+        "audit_report": (output_dir / "audit_report.md").as_posix(),
+        "leakage_check": (output_dir / "leakage_check.json").as_posix(),
+        "pii_audit": (output_dir / "pii_audit_M1.json").as_posix(),
+        "target_distribution": (output_dir / "target_distribution.csv").as_posix(),
+        "audit_manifest": (output_dir / "audit_manifest.json").as_posix(),
+        "audit_table_no_raw_text": (output_dir / "audit_table_no_raw_text.csv").as_posix(),
+    }
+    target_distribution = build_target_distribution(df)
+    df.to_csv(paths["audit_table_no_raw_text"], index=False)
+    target_distribution.to_csv(paths["target_distribution"], index=False)
+    write_json(Path(paths["leakage_check"]), leakage)
+
+    milestone_path = Path("MILESTONE_v2.md") if Path("MILESTONE_v2.md").exists() else Path("MILESTONE.md")
+    audit_manifest = {
+        "task_id": args.kanban_task_id,
+        "task_title": f"T-CYCLE-{args.cycle_id}-AUDIT: 데이터 검증",
+        "cycle_id": args.cycle_id,
+        "created_at_utc": datetime.now(timezone.utc).isoformat(),
+        "milestone_goal_path": milestone_path.as_posix(),
+        "milestone_goal_hash": sha256_file(milestone_path) if milestone_path.exists() else None,
+        "milestone_goal_hash_algorithm": "sha256",
+        "input_roots": {"labels": label_root.as_posix()},
+        "outputs": paths,
+        "verification_command": (
+            f"python3 pipelines/audit_data.py --input {input_root.as_posix()} "
+            f"--output-dir {output_dir.as_posix()} --cycle-id {args.cycle_id} "
+            f"--kanban-task-id {args.kanban_task_id}"
+        ),
+        "summary": summary,
+        "imbalance_checks": imbalance_checks,
+        "imbalance_flags_over_5x": {
+            key: value for key, value in imbalance_checks.items() if value["ratio"] > 5
+        },
+        "leakage_check": leakage,
+        "errors": errors,
+        "status": "FAIL" if errors else "PASS",
+    }
+    Path(paths["audit_report"]).write_text(
+        label_only_audit_report(
+            df,
+            manifest,
+            summary,
+            imbalance_checks,
+            leakage,
+            paths,
+            input_root,
+            label_root,
+            str(args.cycle_id),
+        ),
+        encoding="utf-8",
+    )
+    write_json(Path(paths["audit_manifest"]), audit_manifest)
+
+    if errors:
+        raise SystemExit("; ".join(errors))
+    print(f"audit status: {audit_manifest['status']}")
+    print(f"artifacts: {output_dir.as_posix()}/")
+
+
 def main() -> None:
     args = parse_args()
     input_root = Path(args.input)
@@ -454,6 +833,10 @@ def main() -> None:
     label_root = input_root / "라벨링데이터"
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    if label_root.exists() and not source_root.exists():
+        run_label_only_audit(args, input_root, label_root)
+        return
 
     if not source_root.exists() or not label_root.exists():
         raise FileNotFoundError(f"expected source and label roots under {input_root}")

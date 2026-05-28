@@ -98,6 +98,8 @@ def audit_file(path: str) -> dict:
     doc = json.loads(p.read_text(encoding="utf-8"))
     if not isinstance(doc, dict):
         raise ValueError(f"Expected JSON object, got {type(doc).__name__}: {path}")
+    if not isinstance(doc.get("essay_txt"), str) and not isinstance(doc.get("paragraph"), list):
+        raise ValueError(f"Expected essay JSON with essay_txt or paragraph fields: {path}")
 
     hits: List[PiiHit] = []
     for text in _collect_essay_texts(doc):

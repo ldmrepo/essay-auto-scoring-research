@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Build leakage-free text features for each split fold.
 
-The builder intentionally reads only source JSON files under 원천데이터. Label
-JSON files, audit-table label-side columns, student.location, and target scores
-are not inputs to this pipeline.
+The builder reads only model-visible essay text: Phase 1 source
+``essay_txt`` or Phase 2 label-only ``paragraph[].paragraph_txt``. Audit-table
+label-side columns, student.location, and target scores are not model inputs.
 """
 
 from __future__ import annotations
@@ -39,20 +39,20 @@ NUMERIC_FEATURES = [
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Build per-fold train-only TF-IDF features from source essay_txt."
+        description="Build per-fold train-only TF-IDF features from model-visible essay text."
     )
     parser.add_argument(
         "--audit-table",
         default=None,
         help=(
             "Optional audit_table_no_raw_text.csv used only to verify split/source "
-            "identity and source hashes. Label-side audit columns are not model inputs."
+            "identity and text hashes. Label-side audit columns are not model inputs."
         ),
     )
     parser.add_argument("--source-dir", default="dataset/sample/원천데이터")
     parser.add_argument("--split-dir", default="workspace/cycle_1/splits")
     parser.add_argument("--output-dir", default="workspace/cycle_1/features")
-    parser.add_argument("--cycle-id", type=int, default=1)
+    parser.add_argument("--cycle-id", default="1")
     parser.add_argument("--kanban-task-id", default="t_17813ef2")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--word-max-features", type=int, default=DEFAULT_WORD_MAX_FEATURES)
@@ -85,12 +85,19 @@ def write_json(path: Path, payload: Any) -> None:
 
 def load_audit_index(audit_table: Path) -> dict[str, dict[str, str]]:
     """Load non-text audit metadata for consistency checks only."""
-    required_columns = {
+    source_required_columns = {
         "relative_path",
         "has_source",
         "essay_id_source",
         "essay_txt_present",
         "source_sha256",
+    }
+    label_only_required_columns = {
+        "relative_path",
+        "has_label",
+        "essay_id_label",
+        "paragraph_txt_present",
+        "paragraph_text_sha256",
     }
     forbidden_raw_text_columns = {
         "essay_txt",
@@ -103,9 +110,15 @@ def load_audit_index(audit_table: Path) -> dict[str, dict[str, str]]:
     with audit_table.open("r", encoding="utf-8", newline="") as handle:
         reader = csv.DictReader(handle)
         columns = set(reader.fieldnames or [])
-        missing = required_columns - columns
-        if missing:
-            raise ValueError(f"audit table missing required columns: {sorted(missing)}")
+        has_source_schema = source_required_columns <= columns
+        has_label_only_schema = label_only_required_columns <= columns
+        if not has_source_schema and not has_label_only_schema:
+            source_missing = sorted(source_required_columns - columns)
+            label_missing = sorted(label_only_required_columns - columns)
+            raise ValueError(
+                "audit table missing required columns for both schemas: "
+                f"source_missing={source_missing}; label_only_missing={label_missing}"
+            )
         raw_text_columns = forbidden_raw_text_columns & columns
         if raw_text_columns:
             raise ValueError(
@@ -119,6 +132,28 @@ def load_audit_index(audit_table: Path) -> dict[str, dict[str, str]]:
                 raise ValueError(f"duplicate relative_path in audit table: {relative_path}")
             index[relative_path] = row
     return index
+
+
+def extract_model_text(doc: dict[str, Any], path: Path) -> tuple[str, str]:
+    """Return (essay_id, model-visible essay text) from supported JSON layouts."""
+    essay_id = doc.get("essay_id")
+    raw_text = doc.get("essay_txt")
+    if isinstance(essay_id, str) and isinstance(raw_text, str) and raw_text.strip():
+        return essay_id, raw_text
+
+    info = doc.get("info") if isinstance(doc.get("info"), dict) else {}
+    essay_id = info.get("essay_id")
+    paragraph = doc.get("paragraph", [])
+    paragraph_texts = [
+        item.get("paragraph_txt", "")
+        for item in paragraph
+        if isinstance(item, dict) and isinstance(item.get("paragraph_txt"), str)
+    ] if isinstance(paragraph, list) else []
+    raw_text = "\n".join(paragraph_texts)
+    if isinstance(essay_id, str) and raw_text.strip():
+        return essay_id, raw_text
+
+    raise ValueError(f"missing model-visible essay text in {path}")
 
 
 def normalize_text(raw_text: str) -> str:
@@ -162,39 +197,45 @@ def read_source_row(
     audit_index: dict[str, dict[str, str]] | None,
 ) -> dict[str, Any]:
     relative_path = item["relative_path"]
-    if "라벨링데이터" in relative_path or "label" in relative_path.lower():
-        raise ValueError(f"split item points to a label-like path: {relative_path}")
 
     audit_row = audit_index.get(relative_path) if audit_index is not None else None
     if audit_index is not None and audit_row is None:
         raise ValueError(f"split item missing from audit table: {relative_path}")
     if audit_row is not None:
-        if audit_row.get("has_source") != "True":
-            raise ValueError(f"audit table marks source missing: {relative_path}")
-        if audit_row.get("essay_txt_present") != "True":
-            raise ValueError(f"audit table marks essay_txt missing: {relative_path}")
-        if audit_row.get("essay_id_source") != item.get("essay_id"):
+        if "has_source" in audit_row:
+            if audit_row.get("has_source") != "True":
+                raise ValueError(f"audit table marks source missing: {relative_path}")
+            if audit_row.get("essay_txt_present") != "True":
+                raise ValueError(f"audit table marks essay_txt missing: {relative_path}")
+            audit_essay_id = audit_row.get("essay_id_source")
+            audit_text_hash = audit_row.get("source_sha256")
+        else:
+            if audit_row.get("has_label") != "True":
+                raise ValueError(f"audit table marks label missing: {relative_path}")
+            if audit_row.get("paragraph_txt_present") != "True":
+                raise ValueError(f"audit table marks paragraph text missing: {relative_path}")
+            audit_essay_id = audit_row.get("essay_id_label")
+            audit_text_hash = audit_row.get("paragraph_text_sha256")
+        if audit_essay_id != item.get("essay_id"):
             raise ValueError(
                 "audit/split essay_id mismatch for "
-                f"{relative_path}: audit={audit_row.get('essay_id_source')} "
-                f"split={item.get('essay_id')}"
+                f"{relative_path}: audit={audit_essay_id} split={item.get('essay_id')}"
             )
+    else:
+        audit_text_hash = None
 
     source_path = source_dir / relative_path
     source = load_json(source_path)
-    essay_id = source.get("essay_id")
+    essay_id, raw_text = extract_model_text(source, source_path)
     if essay_id != item.get("essay_id"):
         raise ValueError(
             f"essay_id mismatch for {relative_path}: split={item.get('essay_id')} source={essay_id}"
         )
-    raw_text = source.get("essay_txt")
-    if not isinstance(raw_text, str) or not raw_text.strip():
-        raise ValueError(f"missing essay_txt in {source_path}")
     source_sha256 = sha256_text(raw_text)
-    if audit_row is not None and audit_row.get("source_sha256") != source_sha256:
+    if audit_row is not None and audit_text_hash != source_sha256:
         raise ValueError(
             "audit/source hash mismatch for "
-            f"{relative_path}: audit={audit_row.get('source_sha256')} source={source_sha256}"
+            f"{relative_path}: audit={audit_text_hash} source={source_sha256}"
         )
     return {
         "essay_id": essay_id,
@@ -339,6 +380,7 @@ def feature_config(
     split_manifest_hash: str,
     audit_table_hash: str | None,
     audit_row_count: int | None,
+    expected_fold_count: int,
 ) -> dict[str, Any]:
     return {
         "cycle_id": args.cycle_id,
@@ -356,15 +398,24 @@ def feature_config(
         "split_dir": args.split_dir,
         "split_manifest": f"{args.split_dir}/split_manifest.yaml",
         "split_manifest_sha256": split_manifest_hash,
+        "expected_fold_count": expected_fold_count,
         "output_dir": args.output_dir,
         "seed": args.seed,
         "input_policy": {
-            "allowed_source_fields": ["essay_txt", "essay_id"],
+            "allowed_source_fields": [
+                "source_json.essay_txt",
+                "label_json.info.essay_id",
+                "label_json.paragraph[].paragraph_txt",
+            ],
             "allowed_model_inputs": [
-                "essay_txt-derived features",
+                "essay text-derived features",
                 "student_grade",
             ],
-            "label_json_access": "forbidden",
+            "label_json_access": "forbidden except Phase 2 label-only text fields",
+            "label_only_json_access": (
+                "allowed only for paragraph[].paragraph_txt and info.essay_id "
+                "when source JSONs are not present"
+            ),
             "student_location": "forbidden_model_input; split metadata only",
             "student_grade": "allowed_by_policy_but_not_used_in_this_feature_matrix",
             "target_scores": "forbidden",
@@ -375,7 +426,7 @@ def feature_config(
         },
         "feature_blocks": {
             "word_tfidf": {
-                "source": "essay_txt",
+                "source": "essay_text",
                 "provenance": "derived",
                 "fit_scope": "fold_train_only",
                 "analyzer": "word",
@@ -384,7 +435,7 @@ def feature_config(
                 "max_features": args.word_max_features,
             },
             "char_tfidf": {
-                "source": "essay_txt",
+                "source": "essay_text",
                 "provenance": "derived",
                 "fit_scope": "fold_train_only",
                 "analyzer": "char",
@@ -392,7 +443,7 @@ def feature_config(
                 "max_features": args.char_max_features,
             },
             "derived_numeric": {
-                "source": "essay_txt",
+                "source": "essay_text",
                 "provenance": "derived",
                 "fit_scope": "none",
                 "features": NUMERIC_FEATURES,
@@ -410,9 +461,9 @@ def provenance_manifest(
 ) -> dict[str, Any]:
     features: list[dict[str, Any]] = [
         {
-            "name": "essay_txt",
-            "source": "source_json.essay_txt",
-            "source_field": "essay_txt",
+            "name": "essay_text",
+            "source": "source_json.essay_txt_or_label_json.paragraph[].paragraph_txt",
+            "source_field": "essay_txt_or_paragraph_txt",
             "provenance": "source",
             "derived": False,
             "used_as": "raw input for fit/transform only; raw text is not copied to artifacts",
@@ -420,8 +471,8 @@ def provenance_manifest(
         },
         {
             "name": "word_tfidf_*",
-            "source": "source_json.essay_txt",
-            "source_field": "essay_txt",
+            "source": "source_json.essay_txt_or_label_json.paragraph[].paragraph_txt",
+            "source_field": "essay_txt_or_paragraph_txt",
             "provenance": "derived",
             "derived": True,
             "used_as": "sparse TF-IDF word unigram/bigram features, fit on fold train only",
@@ -429,8 +480,8 @@ def provenance_manifest(
         },
         {
             "name": "char_tfidf_*",
-            "source": "source_json.essay_txt",
-            "source_field": "essay_txt",
+            "source": "source_json.essay_txt_or_label_json.paragraph[].paragraph_txt",
+            "source_field": "essay_txt_or_paragraph_txt",
             "provenance": "derived",
             "derived": True,
             "used_as": "sparse TF-IDF char 2-5gram features, fit on fold train only",
@@ -441,11 +492,11 @@ def provenance_manifest(
         features.append(
             {
                 "name": name,
-                "source": "source_json.essay_txt",
-                "source_field": "essay_txt",
+                "source": "source_json.essay_txt_or_label_json.paragraph[].paragraph_txt",
+                "source_field": "essay_txt_or_paragraph_txt",
                 "provenance": "derived",
                 "derived": True,
-                "used_as": "numeric feature recomputed from raw essay_txt",
+                "used_as": "numeric feature recomputed from model-visible essay text",
                 "label_side": False,
             }
         )
@@ -458,11 +509,12 @@ def provenance_manifest(
         "feature_config_sha256": config_hash,
         "audit_table_path": args.audit_table,
         "audit_table_sha256": audit_table_hash,
-        "audit_table_usage": "source identity/hash validation only; no audit columns become features",
+        "audit_table_usage": "text identity/hash validation only; no audit columns become features",
         "hard_rule_9_status": "PASS",
         "label_side_feature_count": 0,
         "forbidden_inputs_not_used": [
             "dataset/sample/라벨링데이터",
+            "dataset/sample_5k/라벨링데이터 score/rubric/student metadata except allowed text",
             "target_essay_scoreT_avg",
             "essay_scoreT",
             "rater_1",
@@ -505,6 +557,7 @@ def reproducibility_manifest(
     config_hash: str,
     provenance_hash: str,
     fold_outputs: list[dict[str, Any]],
+    expected_fold_count: int,
 ) -> dict[str, Any]:
     return {
         "cycle_id": args.cycle_id,
@@ -549,14 +602,14 @@ def reproducibility_manifest(
             ),
             (
                 "python3 -c \"from scipy import sparse; "
-                f"[sparse.load_npz('{args.output_dir}/X_' + str(i) + '.npz') for i in range(5)]\""
+                f"[sparse.load_npz('{args.output_dir}/X_' + str(i) + '.npz') for i in range({expected_fold_count})]\""
             ),
         ],
     }
 
 
 def feature_verification_report(
-    args: argparse.Namespace, fold_outputs: list[dict[str, Any]]
+    args: argparse.Namespace, fold_outputs: list[dict[str, Any]], expected_fold_count: int
 ) -> str:
     audit_arg = f"--audit-table {args.audit_table} " if args.audit_table else ""
     fold_lines = "\n".join(
@@ -573,7 +626,7 @@ Task: `{args.kanban_task_id}`
 ## Hard Rule #9
 
 - label-side feature count: 0
-- model inputs: train-fold TF-IDF from `essay_txt`; dense features derived from `essay_txt`
+- model inputs: train-fold TF-IDF from model-visible essay text; dense features derived from the same text
 - excluded: `student.location`, target scores, rater scores, label paragraph/correction fields
 - `student_grade`: allowed by policy, not materialized in this matrix
 
@@ -589,9 +642,20 @@ Each fold fits word and char TF-IDF vectorizers only on that fold's train rows, 
 python3 -m py_compile pipelines/build_features.py
 python3 pipelines/build_features.py {audit_arg}--source-dir {args.source_dir} --split-dir {args.split_dir} --output-dir {args.output_dir} --cycle-id {args.cycle_id} --kanban-task-id {args.kanban_task_id} --seed {args.seed}
 python3 -c "import json; m=json.load(open('{args.output_dir}/feature_provenance_manifest.json')); assert m['label_side_feature_count']==0; assert all(f.get('label_side') is False for f in m['features']); assert all('source' in f and 'derived' in f for f in m['features'])"
-python3 -c "import json; from pathlib import Path; d=Path('{args.output_dir}'); assert all(json.load(open(d / f'fold_{{i}}_row_manifest.json'))['row_order']=='train_then_valid' for i in range(5))"
+python3 -c "import json; from pathlib import Path; d=Path('{args.output_dir}'); assert all(json.load(open(d / f'fold_{{i}}_row_manifest.json'))['row_order']=='train_then_valid' for i in range({expected_fold_count}))"
 ```
 """
+
+
+def expected_split_fold_paths(split_dir: Path) -> list[Path]:
+    manifest_path = split_dir / "split_manifest.yaml"
+    manifest = yaml.safe_load(manifest_path.read_text(encoding="utf-8"))
+    expected_fold_count = int(manifest["k"])
+    paths = [split_dir / f"fold_{fold}.json" for fold in range(expected_fold_count)]
+    missing = [path.as_posix() for path in paths if not path.is_file()]
+    if missing:
+        raise FileNotFoundError(f"missing split fold files: {missing}")
+    return paths
 
 
 def main() -> int:
@@ -612,6 +676,8 @@ def main() -> int:
 
     split_manifest_path = split_dir / "split_manifest.yaml"
     split_manifest_hash = sha256_file(split_manifest_path)
+    fold_paths = expected_split_fold_paths(split_dir)
+    expected_fold_count = len(fold_paths)
     audit_index = load_audit_index(audit_table) if audit_table is not None else None
     audit_table_hash = sha256_file(audit_table) if audit_table is not None else None
     audit_row_count = len(audit_index) if audit_index is not None else None
@@ -622,13 +688,14 @@ def main() -> int:
         split_manifest_hash=split_manifest_hash,
         audit_table_hash=audit_table_hash,
         audit_row_count=audit_row_count,
+        expected_fold_count=expected_fold_count,
     )
     with config_path.open("w", encoding="utf-8") as handle:
         yaml.safe_dump(config_doc, handle, allow_unicode=True, sort_keys=False)
     config_hash = sha256_file(config_path)
 
     fold_outputs = []
-    for fold_path in sorted(split_dir.glob("fold_*.json")):
+    for fold_path in fold_paths:
         fold_outputs.append(
             build_fold(
                 fold_path=fold_path,
@@ -640,8 +707,10 @@ def main() -> int:
             )
         )
 
-    if len(fold_outputs) != 5:
-        raise RuntimeError(f"expected 5 fold outputs, got {len(fold_outputs)}")
+    if len(fold_outputs) != expected_fold_count:
+        raise RuntimeError(
+            f"expected {expected_fold_count} fold outputs, got {len(fold_outputs)}"
+        )
 
     manifest_path = output_dir / "feature_provenance_manifest.json"
     write_json(
@@ -660,11 +729,12 @@ def main() -> int:
             config_hash=config_hash,
             provenance_hash=provenance_hash,
             fold_outputs=fold_outputs,
+            expected_fold_count=expected_fold_count,
         ),
     )
     verification_report_path = output_dir / "feature_verification_report.md"
     verification_report_path.write_text(
-        feature_verification_report(args, fold_outputs),
+        feature_verification_report(args, fold_outputs, expected_fold_count),
         encoding="utf-8",
     )
 
