@@ -1,67 +1,194 @@
-# Milestone Goal v3 (Phase 3 — placeholder, 대기 상태)
+# Milestone Goal v3 (Phase 3 Multi-task)
 
-> **상태**: Phase 2 종료 후 대기. 본격 작성은 사용자 Phase 3 진입 결정 시.
-> **선행 문서**: `docs/multi_task_채점모델_구현_스펙_v_1_0.md` (multi-task 설계 스펙, v1.0)
-> **Phase 2 종료 사유**: 단일 타겟 학습이 사용자 실제 목적(루브릭별 채점)과 불일치 (MILESTONE_v2.md 종료 노트 참조)
+> **상태**: 확정 (2026-05-28). Phase 2 종료 후 사용자 옵션 A 채택으로 D1~D6 일괄 확정 + Step 2~7 자율 진행 완료.
+> **선행 문서**:
+> - `docs/multi_task_채점모델_구현_스펙_v_1_1.md` — 모델 스펙 v1.1 (외부 리뷰 6건 + D1~D6 반영)
+> - `docs/phase_3_operations_guide_v_1_0.md` — 운영 가이드 (C1~C6 절차)
+> - `docs/dataset_채점방식_분석_v_1_0.md` v1.1 — 데이터셋 분석 (검증 완료)
+> - `MILESTONE_v2.md` — Phase 2 종료 노트
+>
+> Hard Rule #10 source — Cycle MN의 AUDIT sub-task body에 verbatim 재주입되는 goal anchor.
+> 본 문서는 변경 시 AGENTS.md LOCKED 변경과 동일한 인간 게이트 필요.
 
 ---
 
-## Phase 3 핵심 방향 (확정 사항)
+## Goal
 
-| 항목 | 결정 |
+Hermes Multi-Agent Kanban Board로 한국어 K-12 에세이의 **루브릭별 (대분류 3 + overall) 차원 채점 모델**을
+**중단없는 지속적 실행 (사용자 개입 cycle당 < 1회)** 자가발전 long-running chain으로 달성한다.
+
+Phase 3는 Phase 2의 단일 타겟 학습(`essay_scoreT_avg`)에서 multi-task (`exp / org / cont / overall`)로 전환하여
+사용자 실제 목적(루브릭별 점수 + 차원별 진단)에 정합한다.
+
+Phase 2의 6대 중단 원인(C1~C6)을 사전 대응 절차(`phase_3_operations_guide_v_1_0.md`) + Hard Rule #15~#18로 명문화하여
+worker hang / DB 손상 / 권한 차단 / 진행 가시성 / 인간 개입 빈도 모두를 0~최소화한다.
+
+---
+
+## Phase 3 핵심 방향 (D1~D6 확정)
+
+| # | 항목 | 결정 | 출처 |
+|---|---|---|---|
+| **D1** | 차원별 fairness gate | C: 차원별 worst_band hard-block | 스펙 v1.1 § 6 A3 |
+| **D2** | 손실 스케일 | A: overall 0~3 정규화 | 스펙 v1.1 § 3 |
+| **D3** | 출력 단위 | 하이브리드 3+overall (대분류 3 + 보조 overall) | 스펙 v1.1 § 2 |
+| **D4** | 데이터 규모 | 5K (Phase 2 inheritance, `dataset/sample_5k/`) | 스펙 v1.1 § 7.3 |
+| **D5** | base 모델 크기 | klue/roberta-small (Phase 2 inheritance) | 스펙 v1.1 § 11.1 |
+| **D6** | M6 ensemble 처리 | scalar 폐기 + multi-output OOF 재작성 | 스펙 v1.1 § 4, § 12 |
+
+---
+
+## Success Criteria (Phase 3 Mid Multi-task acceptance)
+
+ACCEPTANCE_CRITERIA.yaml `stages.mid_multitask` 본문 mapping. 본 표는 T3-01 fix로 Hard Rule + 측정 방법 column 추가.
+
+| # | Criteria | 임계 | Hard Rule | 측정 방법 (출처) |
+|---|---|---|---|---|
+| 1 | M5 overall `qwk_lower95` ≥ 0.40 | 0.40 | #5, #14 | `evaluate.py` overall_raw bootstrap CI lower (B=1000) |
+| 2 | M5 per-rubric `qwk_lower95` ≥ 0.30 (exp/org/cont) | 0.30 | #15 | `evaluate.py` per-dim QWK + bootstrap CI lower |
+| 3 | M5 > M4 strict (`M5_overall_lower95 > M4_overall_upper95`) | strict | #5 | `acceptance.baseline_ordering_overall` (raw_0_30) |
+| 4 | M6 > M5 strict (overall) | strict | #5 | 동상 |
+| 5 | **All-dimension** fairness gate (exp/org/cont 각 native 0~3 + overall raw 0~30 — 각 `worst_band_qwk ≥ macro_qwk × 0.7`) | × 0.7 | #14 (확장), #15 | `fairness_gate.unit_per_dimension` + score_band_cutoffs |
+| 6 | Optuna HPO trial 수 (M2 단독 30+, M3+ 누적 50+ 및 cycle당 5+ 추가) | M2: 30 / M3+: 50 | #12 | optuna study `len(study.trials)` + cycle delta |
+| 7 | 모든 fold valid_n ≥ 300 (k=5) | 300 | SPLIT | `make_splits.py` manifest |
+| 8 | judgement: PASS_CANDIDATE | enum | — | SYNTH cycle report (`final_judgement_allowed: false` 정합) |
+| 9 | **차원별 단조 후퇴 0건** (T1-05 신설) | 0 | #15 | `per_rubric_monotone_evolution.warn_condition` |
+| 10 | **evaluator wire-up 완료** (T1-03 신설, Phase 3 M2 진입 게이트) | true | (운영) | `mid_multitask._implementation_status == wired_v1` |
+
+## Phase 3 진입 게이트 (Cycle M2 첫 sub-task)
+
+본 criteria #10이 PASS될 때까지 Cycle M2의 EVAL sub-task는 dead spec 위험. M2 first sub-task로 다음을 등록:
+
+```
+T-CYCLE-M2-WIRE-UP (gauss + turing) — Phase 3 evaluator + acceptance wire-up
+  ├── pipelines/evaluate.py에 mid_multitask 분기 추가
+  ├── score_band_per_rubric() 함수 (T1-04 cutoff 적용)
+  ├── fairness_gate_per_rubric() 함수 + 차원별 lower95
+  ├── auto_continue 평가 로직 — R2-NEW-G3/G4/G5 fix 명시:
+  │     - consecutive_pass_candidate_max: 2
+  │     - evolution_progress_required.window_cycles=2 + grace_cycles=3
+  │       → cycle index >= grace_cycles+1 (즉 M5부터) 본 임계 적용 시작 (R2-NEW-G3 결정)
+  │     - per_rubric_monotone_evolution: cross-cycle M{N+1} vs M{N} 비교 (warn)
+  │     - m6_per_rubric_evolution: same-cycle M5 vs M6 ensemble 비교 (warn) — comparison_scope: same_cycle 명시 처리 (R2-NEW-G4)
+  ├── tests/test_evaluate_phase3.py 신설 + 통과
+  └── ACCEPTANCE_CRITERIA.yaml mid_multitask._implementation_status: wired_v1 갱신
+```
+
+위 task 완료 + tests/test_evaluate_phase3.py 통과 후 본격 cycle (AUDIT → SPLIT → ... → SYNTH → DECIDE) 진행.
+
+---
+
+## 중단없는 지속적 실행 (Phase 2 → Phase 3 대응)
+
+| Phase 2 중단 원인 | Phase 3 사전 대응 | Hard Rule | 산출 |
+|---|---|---|---|
+| C1: worker 10분 timeout → hang | Long-running off-worker 패턴 (vast.ai background + polling) | #16 | `scripts/poll_vast_progress.sh`, ops § 1 |
+| C2: hermes network_access=false hard-code | 패치 영구 유지 + cycle 시작 시 검증 | (운영) | `scripts/verify_hermes_patch.sh`, ops § 2 |
+| C3: sandbox approval 거부 | `danger-full-access` + `approval_policy=never` 유지 | (운영) | `~/.codex/config.toml`, ops § 3 |
+| C4: kanban DB 손상 | 자동 백업 (cycle 시작 + 6h cron) + 표준 recovery | #18 | `scripts/backup_kanban_db.sh`, ops § 4 |
+| C5: GPU util 0% / 진행 상태 불명 | progress.json 주기 갱신 + checkpoint | #17 | `scripts/write_progress.py`, `poll_vast_progress.sh`, ops § 5 |
+| C6: 사용자 개입 빈도 높음 | D1~D6 사전 확정 + 자동 PASS 임계 + 비상시만 인간 게이트 | (운영) | ACCEPTANCE_CRITERIA `auto_continue`, ops § 6 |
+
+Phase 3 운영 KPI (T3-01 + T3-02 + R2-F11 + R3-F22 fix — 측정 방법 명시):
+
+| 지표 | 목표 | 측정 방법 | Phase 2 baseline 출처 |
+|---|---|---|---|
+| 사용자 개입 빈도 (DECIDE auto_continue 제외) | cycle당 < 1회 | SYNTH가 cycle 내 `human_intervention_count` 집계 (kanban task owner=human + DECIDE 제외) | Phase 2 Cycle M1 archive log (사용자 직접 명령 5회: 권한 승인 2회 / DB 복구 1회 / vast.ai check 2회) |
+| Worker hang 발생 | 0회 | cycle metadata `worker_hang_count` (10분 timeout 사후 검출) | Phase 2 M5 hang 1건 (vast.ai 학습 timeout) |
+| kanban DB 손상 | 0회 (자동 복구 성공) | preflight integrity_check fail 횟수 0 | Phase 2 1건 (수동 comment 작성 중) |
+| vast.ai 학습 결과 회수 성공률 | 100% | polling task DONE marker 수신 / 전 학습 task 수 | Phase 2 0/1 (M5 미수행) |
+| Cycle 평균 wall-clock | < 4h | SYNTH가 cycle 시작 (AUDIT spawn) ~ DECIDE 등록 시각 차 | Phase 2 M1 비교 불가 (미완 종료) → Phase 3 M2 첫 cycle을 baseline으로 |
+| **차원별 단조 후퇴 (T1-05)** | 0회 | EVAL이 `per_rubric_monotone_evolution.warn_condition` 평가 | Phase 3 신규 |
+
+cycle metadata 표준 schema (`cycle_report.json`):
+```json
+{
+  "cycle_id": "M2",
+  "started_at": "2026-...",
+  "ended_at": "2026-...",
+  "wall_clock_sec": 14400,
+  "user_interventions": [{"task_id": "...", "kind": "...", "at": "..."}],
+  "worker_hang_count": 0,
+  "db_integrity_check_passes": 1,
+  "vast_ai_recovery_rate": 1.0,
+  "per_rubric_monotone_regressions": []
+}
+```
+
+---
+
+## Out of Scope (본 milestone 종결 후)
+
+- 풀데이터 50K 학습 (Phase 3 Full, 별도 milestone)
+- `klue/roberta-base` (110M, Phase 3 안정화 후 D5 update)
+- `klue/roberta-large` (337M, 24GB VRAM, Phase 4 GPU budget 확보 후)
+- 소분류 9~11 head (스펙 v1.1 § 8 단계 D, M4+ cycle)
+- Paragraph-level auxiliary task (스펙 v1.1 § 8 단계 E)
+- Production model registration / champion alias (Phase 4 인간 + 법무 게이트)
+- 외부 배포 (Phase 4)
+
+---
+
+## Phase Transition Criteria
+
+| 진입 | 조건 |
 |---|---|
-| **학습 타겟** | 루브릭 차원별 multi-task (`essay_scoreT_avg` 단일 타겟 폐기) |
-| **출력 단위** | 1단계: 대분류 3 + overall 1 (총 4) / 2단계: 소분류 9~11 확장 |
-| **데이터** | Phase 2와 동일 `dataset/sample_5k/` (5003편) 또는 풀데이터 `dataset/1.Training` (50K+) |
-| **가중치 source** | JSON `rubric` 필드 동적 로드 (PDF spec 의존 제거) |
-| **base 모델** | KLUE-RoBERTa-small (Phase 2 inheritance) → 안정화 후 `klue/roberta-base` 검토 |
+| Phase 3 Mid → Phase 3 Mid+1 (klue/roberta-base) | Success Criteria 1~5 통과 + small 모델 안정화 입증 + 사용자 [Phase-up] DECIDE |
+| Phase 3 → Phase 4 (Full + Production) | Phase 3 PASS_CANDIDATE + bias audit + 인간 + 법무 게이트. PASS_FINAL은 Phase 4 acceptance에서만 허용 |
 
 ---
 
-## Success Criteria (placeholder, 진입 시 확정)
+## Self-Improving Loop Reminder
 
-1. **M5 multi-task per-rubric QWK lower95 ≥ 0.30** (exp/org/cont 각각)
-2. **M5 overall QWK lower95 ≥ 0.40** (Phase 2 기준 유지)
-3. **M5 > M4 strict** (overall 기준, 단조 진화)
-4. **Score-Band Fairness Gate 차원별 적용** (Hard Rule #14 확장)
-5. **Optuna HPO 누적 50+ trial** (multi-task 변형)
-6. **PASS_CANDIDATE 또는 PASS_FINAL** 도달
+각 Cycle MN은 8개 worker sub-task + DECIDE chain (Phase 2 HPO 구조 유지). M2는 WIRE-UP 1회성 sub-task가 AUDIT 앞에 추가된다:
+
+```
+T-CYCLE-M2-WIRE-UP   (gauss+turing, M2 only)
+  ↓ Phase 3 evaluator + acceptance wire-up
+T-CYCLE-MN-AUDIT     (tukey)
+  ↓ 0순위: cycle_preflight.sh MN 실행 (Hard Rule #18 12-항목 체크 — R2-NF9 fix)
+  ↓ MILESTONE_v3.md goal 재주입 (Hard Rule #10)
+T-CYCLE-MN-SPLIT     (gauss)
+T-CYCLE-MN-FEATURE   (gauss)
+T-CYCLE-MN-MODEL     (gauss)
+  ↓ M5/M6는 off-worker (Hard Rule #16) + progress.json (Hard Rule #17)
+T-CYCLE-MN-HPO       (gauss)
+T-CYCLE-MN-EVAL      (spearman) ┐
+T-CYCLE-MN-REVIEW    (turing)   ┘ 병렬 (T-HPO parent)
+  ↓ per-rubric metric + per-rubric fairness gate (Hard Rule #15)
+T-CYCLE-MN-SYNTH     (aristotle)
+  ↓ parent
+DECIDE-MN            (사용자 또는 auto_continue)
+  ↓ auto_continue 조건 충족 시 자동 [Continue] (6h grace 후)
+```
+
+SYNTH가 다음 Cycle M(N+1)의 8개 worker sub-task + DECIDE 등록 (PASS_CANDIDATE/FAIL 무관).
+DECIDE-MN [Continue] 또는 auto_continue → Cycle M(N+1) 자동 시작.
 
 ---
 
-## 사용자 결정 대기 항목 (진입 시)
+## Cycle ID 명명 (T3-13 + R2-F16 + R2-NF10 fix — Phase 2/3 disambiguate)
 
-| # | 항목 | 옵션 |
-|---|---|---|
-| **D1** | 차원별 fairness gate 정의 | A: overall band 내 차원별 metric / B: 차원별 band 새 정의 / **C: 차원별 worst_band hard-block** |
-| **D2** | 손실 스케일 | **A: overall 0~3 정규화** / B: loss weight 보정 |
-| **D3** | 출력 단위 | **하이브리드 3+overall** / 소분류 9~11 / 두 단계 |
-| **D4** | 데이터 규모 | 5K (Phase 2 데이터 재사용) / 50K (풀데이터) |
-| **D5** | base 모델 크기 | klue/roberta-small (68M) / klue/roberta-base (110M) |
-| **D6** | M6 ensemble 처리 | scalar 폐기 + multi-output OOF로 재작성 / M6 자체 제거 |
+Phase 3 Mid Multi-task는 prefix `M` 유지하되 다음 규칙으로 Phase 2와 disambiguate:
 
-(권장은 `dataset_채점방식_분석_v_1_0.md` v1.1 § 8, `multi_task_채점모델_구현_스펙_v_1_0.md` 참조)
+- **Phase 3 cycle ID**: `M2`, `M3`, ... (Phase 2의 `M1` 종료에 이어 M2부터)
+- **Phase 2 archive** (이미 종료): `workspace/cycle_M1/` 그대로 보존. 신규 산출 금지
+- **mlflow + kanban search 시 disambiguate**: cycle_id와 함께 **phase tag 의무** (`phase=3` 또는 `phase=2`) — MLflow `mlflow_recording.required_tags`에 `phase` 추가 필요 (Phase 3 wire-up 시점)
+- **artifact 명명**: Phase 2 잔존 산출(`mlflow_remote_M1.db` 등)은 `mlflow_phase2_M1.db`로 rename 권고 (수동, 우선순위 낮음)
+- **AGENTS.md cycle ID 명명 정합 (R2-NF10)**: AGENTS.md `Cycle ID 명명` 절(Mid-scale prefix `M`)에 본 disambiguate 규칙 cross-ref 의무 (별도 update)
 
----
-
-## 변경 범위 (Phase 2 대비)
-
-| 영역 | 변경 |
-|---|---|
-| `pipelines/train.py` | `TARGET_NAME` → `TARGET_NAMES` 다중 |
-| `pipelines/train_transformer.py` | `num_labels=1` → `num_labels=4` + custom loss + dataset/collator multi-label |
-| `pipelines/train_ensemble.py` | scalar → multi-output OOF stacking (전면 재작성) |
-| `pipelines/evaluate.py` | per-rubric metric + per-rubric fairness gate |
-| `MILESTONE_v3.md` (본 문서) | placeholder → 확정 success criteria |
-| `AGENTS.md` Hard Rule #5/#14 | 차원별 적용 규칙 |
-| `ACCEPTANCE_CRITERIA.yaml` | per-rubric threshold |
+Phase 3 Full 진입 시 prefix `F` 사용 (`F1`, `F2`, ... — AGENTS.md 본문 inheritance).
 
 ---
 
 ## References
 
-- `docs/multi_task_채점모델_구현_스펙_v_1_0.md` — multi-task 구현 스펙 (외부 리뷰 6건 정정 적용 v1.1 예정)
-- `docs/dataset_채점방식_분석_v_1_0.md` v1.1 — 데이터셋 루브릭 구조 분석 (검증 완료)
+- AGENTS.md v5 — Hard Rules #1~#18 (Phase 3 #15~#18 신설)
+- `docs/multi_task_채점모델_구현_스펙_v_1_1.md` — 모델 스펙 v1.1
+- `docs/phase_3_operations_guide_v_1_0.md` — 운영 가이드 v1.0
+- `docs/dataset_채점방식_분석_v_1_0.md` v1.1 — 데이터셋 분석
+- `ACCEPTANCE_CRITERIA.yaml` `stages.mid_multitask` — Phase 3 acceptance
+- `scripts/` — 운영 도구 (backup_kanban_db / verify_hermes_patch / poll_vast_progress / write_progress / cycle_preflight)
 - `MILESTONE_v2.md` — Phase 2 종료 노트
-- `AGENTS.md` v5 — Hard Rules
 - `workspace/cycle_M1/` — Phase 2 보존 산출 (재현 기준)
+- `dataset/sample_5k/manifest.json` — primary 데이터셋 spec (D4 inheritance)

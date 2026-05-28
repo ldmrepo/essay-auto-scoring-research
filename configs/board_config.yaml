@@ -44,4 +44,49 @@ auto_cycle:
   goal_anchor:
     enabled: true
     inject_into_first_subtask: true
-    source: "MILESTONE.md"              # 인간이 작성, cycle 시작 시 read-only inject
+    # 2026-05-28: Phase 3 진입 후 MILESTONE_v3.md (Phase 2는 MILESTONE_v2.md, Phase 1은 MILESTONE.md)
+    # 단계 phase에 따라 active goal anchor 자동 선택. wire-up은 SYNTH가 cycle_id에서 phase 추론.
+    source_by_phase:
+      phase_1: "MILESTONE.md"
+      phase_2: "MILESTONE_v2.md"
+      phase_3: "MILESTONE_v3.md"
+    source_fallback: "MILESTONE_v3.md"   # active phase 추론 불가 시
+
+# T2-05 + R4-F4 fix: 비상 게이트 외부 알림 채널 (Phase 3 운영)
+# Phase 2에서 사용자 개입 빈도 5+회였던 원인 — 게이트 시점 알림이 board UI only였음
+notify_channels:
+  enabled: true
+  required_count: 1                     # durable channel 1종 이상 가용 필요 (cycle_preflight [10/12] 검증)
+  push_required_count: 0                # user-push 강제 시 1로 올림. enabled push channel 실패 시 notify_alert가 FAIL.
+  channels:
+    - kind: file
+      enabled: true
+      target: "~/.hermes/kanban/alerts/alerts.log"
+      condition: "always"                # headless/server fallback, notify_alert.sh always writes here
+    - kind: notify-send
+      enabled: false                    # headless/WSL 기본값은 false. desktop 사용 시 true.
+      target: "desktop"
+      condition: "always"                # local 데스크톱 환경 가정
+    - kind: webhook
+      enabled: false                     # 사용 시 enabled: true + env: PHASE3_WEBHOOK_URL
+      env: PHASE3_WEBHOOK_URL
+      method: POST
+      timeout_sec: 5
+    - kind: mail
+      enabled: false
+      env: PHASE3_ALERT_EMAIL
+      from: "phase3-bot@localhost"
+  triggers:
+    # 비상 게이트 (cycle 진행 직접 영향)
+    - cost_circuit_breaker_breach
+    - hermes_patch_verification_fail
+    - kanban_db_recovery_required
+    - cycle_3_consecutive_acceptance_fail
+    - pass_candidate_stuck_consecutive_max
+    - auto_destroy_stale_vast_instance_executed
+    - phase_3_evaluator_wire_up_pending
+    # NEW-H2 fix (R4 3차): notify_alert.sh whitelist와 정합 — board_config 단일 source-of-truth
+    - preflight_self_test                  # cycle_preflight 통과/실패 self-test
+    - auto_repatch_executed                # verify_hermes_patch --auto-repatch-confirmed 실행
+    - progress_stall_detected              # poll_vast_progress stall/unreachable
+  note: "Hard Rule #11 + Hard Rule #14 + Hard Rule #16/17/18 + auto_continue consecutive_pass_candidate_max — 모든 비상 게이트는 durable file-log 1종 이상을 남긴다. user-push는 push_required_count와 channel enabled=true로 명시 강제한다."

@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from pipelines.extract_5k import extract_strat_keys
+from pipelines.extract_5k import extract_strat_keys, validate_rubric_for_phase3
 
 
 def _essay(essay_type="글짓기", grade_group="중등", level="2", essay_id="ESSAY_1"):
@@ -24,7 +24,44 @@ def _essay(essay_type="글짓기", grade_group="중등", level="2", essay_id="ES
             "location": "001",
         },
         "paragraph": [{"paragraph_txt": "테스트 본문", "paragraph_id": "001"}],
-        "score": {"essay_scoreT_avg": 20.0},
+        "score": {
+            "essay_scoreT_avg": 20.0,
+            "essay_scoreT_detail": _valid_score_detail(),
+        },
+        "rubric": _valid_rubric(),
+    }
+
+
+def _valid_rubric():
+    return {
+        "expression_weight": {
+            "exp_grammar": 3,
+            "exp_vocab": 3,
+            "exp_style": 0,
+            "exp": 3,
+        },
+        "organization_weight": {
+            "org_paragraph": 0,
+            "org_essay": 7,
+            "org_coherence": 2,
+            "org_quantity": 1,
+            "org": 3,
+        },
+        "content_weight": {
+            "con_clearance": 4,
+            "con_description": 2,
+            "con_novelty": 2,
+            "con_prompt": 1,
+            "con": 4,
+        },
+    }
+
+
+def _valid_score_detail():
+    return {
+        "essay_scoreT_exp": [[3, 2, 0], [3, 3, 0], [2, 3, 0]],
+        "essay_scoreT_org": [[3, 0, 3, 3], [2, 0, 3, 2], [2, 0, 2, 3]],
+        "essay_scoreT_cont": [[3, 3, 3, 2], [3, 2, 3, 2], [2, 2, 2, 3]],
     }
 
 
@@ -54,6 +91,41 @@ class TestExtractStratKeys:
         del d["info"]["essay_level"]
         with pytest.raises(KeyError, match="essay_level"):
             extract_strat_keys(d)
+
+
+class TestValidateRubricForPhase3:
+    def test_valid_schema_passes(self):
+        ok, reason = validate_rubric_for_phase3(_essay())
+        assert ok is True
+        assert reason == ""
+
+    def test_missing_macro_weight_fails(self):
+        d = _essay()
+        del d["rubric"]["expression_weight"]["exp"]
+        ok, reason = validate_rubric_for_phase3(d)
+        assert ok is False
+        assert "rubric.expression_weight.exp macro weight missing" in reason
+
+    def test_non_numeric_sub_weight_fails(self):
+        d = _essay()
+        d["rubric"]["content_weight"]["con_clearance"] = "4"
+        ok, reason = validate_rubric_for_phase3(d)
+        assert ok is False
+        assert "non-numeric sub-weights" in reason
+
+    def test_score_detail_shape_fails(self):
+        d = _essay()
+        d["score"]["essay_scoreT_detail"]["essay_scoreT_org"][0] = [3, 0, 3]
+        ok, reason = validate_rubric_for_phase3(d)
+        assert ok is False
+        assert "essay_scoreT_org rater 0 length must be 4" in reason
+
+    def test_overall_raw_range_fails(self):
+        d = _essay()
+        d["score"]["essay_scoreT_avg"] = 31
+        ok, reason = validate_rubric_for_phase3(d)
+        assert ok is False
+        assert "outside 0~30" in reason
 
 
 class TestStratifiedSample:
@@ -138,7 +210,11 @@ def _write_essay(root: Path, essay_type: str, grade_group: str, level: str, essa
             "location": "001",
         },
         "paragraph": [{"paragraph_txt": "테스트 본문", "paragraph_id": "001"}],
-        "score": {"essay_scoreT_avg": 20.0},
+        "score": {
+            "essay_scoreT_avg": 20.0,
+            "essay_scoreT_detail": _valid_score_detail(),
+        },
+        "rubric": _valid_rubric(),
     }
     path.write_text(json.dumps(doc, ensure_ascii=False), encoding="utf-8")
     return path
@@ -237,6 +313,33 @@ class TestExtractCli:
         assert "by_stratum" in manifest
         # 8 strata × 2 essays each (16/8) = 2 per stratum
         assert all(v == 2 for v in manifest["by_stratum"].values())
+
+    def test_validate_rubric_flag_skips_schema_drift(self, tmp_path):
+        from pipelines.extract_5k import _main
+
+        src_root = tmp_path / "src" / "라벨링데이터"
+        dst_root = tmp_path / "out"
+        valid_path = _write_essay(src_root, "글짓기", "초등", "1", "ESSAY_VALID")
+        invalid_path = _write_essay(src_root, "글짓기", "초등", "1", "ESSAY_INVALID")
+        invalid_doc = json.loads(invalid_path.read_text(encoding="utf-8"))
+        del invalid_doc["rubric"]["expression_weight"]["exp"]
+        invalid_path.write_text(json.dumps(invalid_doc, ensure_ascii=False), encoding="utf-8")
+
+        rc = _main([
+            str(src_root.parent),
+            "--out", str(dst_root),
+            "--target-n", "2",
+            "--seed", "42",
+            "--validate-rubric",
+        ])
+        assert rc == 0
+
+        copied = [p.name for p in dst_root.rglob("*.json") if p.name != "manifest.json"]
+        assert copied == [valid_path.name]
+        manifest = json.loads((dst_root / "manifest.json").read_text(encoding="utf-8"))
+        assert manifest["actual_n"] == 1
+        assert manifest["drift_skipped"]["total"] == 1
+        assert "rubric.expression_weight.exp macro weight missing" in manifest["drift_skipped"]["by_reason"]
 
     def test_deterministic_end_to_end(self, tmp_path):
         from pipelines.extract_5k import _main

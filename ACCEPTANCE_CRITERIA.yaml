@@ -31,13 +31,17 @@ global_hard_gates:
     operator: "contains_all"
     value:
       - cycle_id
+      - phase
       - kanban_task_id
       - feature_provenance
     failure_judgement: FAIL_RETRY_HPO
   rubric_weights_externalized:
     operator: "=="
     value: true
-    source: "configs/rubric_weights.yaml"
+    source:
+      phase_1_2_audit: "configs/rubric_weights.yaml"
+      phase_3_dynamic_loss: "essay_json.rubric.{expression_weight.exp,organization_weight.org,content_weight.con}"
+    note: "Phase 3는 per-essay JSON rubric을 동적 loss weight source로 사용. configs/rubric_weights.yaml은 audit/reporting schema reference."
     failure_judgement: FAIL_REBUILD_FEATURES
   feature_provenance_label_side_count:
     operator: "=="
@@ -188,6 +192,206 @@ stages:
     pass_judgement: PASS_CANDIDATE
     final_judgement_allowed: false
 
+  # Phase 3 multi-task 진입 후 활성. Phase 2 종료 (2026-05-28) → Phase 3 multi-task 채택.
+  # source: docs/multi_task_채점모델_구현_스펙_v_1_1.md § 6 + AGENTS.md Hard Rule #15
+  #
+  # T1-03 (R2-F1): wire-up 상태 명시 — Phase 3 M2 first sub-task로 evaluator 분기 추가 필요.
+  # 본 stage 활성화 전까지 pipelines/evaluate.py가 mid_multitask 분기를 인지하지 못함.
+  # R2-NF3 fix: _inherits_semantics 제거 (dead documentation). mid_multitask는 self-contained.
+  mid_multitask:
+    _implementation_status: not_wired_yet
+    _wire_up_required:
+      - "pipelines/evaluate.py에 mid_multitask 분기 추가 (현재 toy 단일 분기만 존재)"
+      - "차원별 score_band cutoff 함수 추가 (T1-04, score_band_per_rubric)"
+      - "fairness_gate_per_rubric() 함수 + 차원별 lower95 계산"
+      - "auto_continue 조건 evaluator/SYNTH 양측 구현"
+      - "wire-up 완료 후 _implementation_status를 wired_v1로 변경 + Phase 3 M2 SYNTH 검증"
+      - "cycle_preflight.sh [11/12]가 wired_v1 확인 후에만 M3+ 진입 허용 (R2-NF1 fix)"
+    scope:
+      dataset: "dataset/sample_5k/ (Phase 2 inheritance — D4)"
+      max_rows: 5003
+      models:
+        - M1_dummy           # single-target (baseline floor)
+        - M2_length          # single-target
+        - M3_tfidf_ridge     # single-target
+        - M4_lightgbm        # single-target
+        - M5_klue_roberta_multitask    # multi-task (3+overall, D3+D5)
+        - M6_multi_output_oof          # multi-task ensemble (D6)
+      forbidden:
+        - m5_single_target_regression  # Hard Rule #15 위반
+        - m6_scalar_stacking            # D6 — scalar 인터페이스 폐기
+        - autonomous_full_dataset_load
+        - final_model_registration
+        - external_deployment
+    # T1-04 (R2-F2): 차원별 score_band cutoff 정의
+    # overall은 raw(0~30) 기준, 차원별(exp/org/cont)은 native(0~3) 기준
+    score_band_cutoffs:
+      overall_raw:
+        low_0_9:   { min: 0,  max: 9  }
+        mid_10_19: { min: 10, max: 19 }
+        high_20_30: { min: 20, max: 30 }
+      per_rubric_native:        # exp / org / cont 공통 (0~3)
+        low_0_1:   { min: 0.0, max: 1.0 }
+        mid_1_2:   { min: 1.0, max: 2.0 }
+        high_2_3:  { min: 2.0, max: 3.0 }
+      note: "T1-04 fix — 차원별 native band cutoff. overall band(0~30)와 별도 평가. 평가 시 essay-level이 아닌 dimension-level segment 사용."
+    primary_metrics:
+      m5_overall_qwk_lower95:
+        operator: ">="
+        value: 0.40
+        hard_block: true
+        failure_judgement: FAIL_CHANGE_MODEL
+        note: "Phase 2 inheritance — overall acceptance 기준 유지. raw(0~30) 단위로 산출."
+      m5_per_rubric_qwk_lower95:
+        operator: ">="
+        value: 0.30
+        hard_block: true
+        applies_to: [exp, org, cont]
+        failure_judgement: FAIL_CHANGE_MODEL
+        note: "Phase 3 신규 — 차원별 acceptance. 임계 0.30 근거 — overall 0.40 대비 1단계 낮춤 (차원별 학습 신호 빈약 고려)."
+    secondary_metrics:
+      # T2-07 (R2-F4): multi-task train_valid_qwk_gap_abs 정의 명시
+      train_valid_qwk_gap_abs:
+        operator: "<="
+        value: 0.10
+        hard_block: true
+        applies_to: [exp, org, cont, overall]
+        aggregation: max         # 가장 엄격한 차원 기준
+        failure_judgement: FAIL_CHANGE_MODEL
+        note: "T2-07 fix — multi-task에서 차원별 4 gap 중 max 적용."
+      baseline_ordering_overall:
+        operator: "ordered_non_decreasing"
+        value:
+          - M1_qwk_overall
+          - M2_qwk_overall
+          - M3_qwk_overall
+          - M4_qwk_overall
+          - M5_qwk_overall
+          - M6_qwk_overall
+        hard_block: true
+        ci_required: true
+        ci_strict: true
+        unit: "raw_0_30"
+        note: "M5 ≤ M6 strict (M6_lower95 > M5_upper95) — Hard Rule #5. raw(0~30) 단위로 산출."
+      # T1-05 (R2-F3): 차원별 단조 후퇴 검출 게이트 — info → warn 격상
+      per_rubric_monotone_evolution:
+        operator: "warn"
+        applies_to: [exp, org, cont]
+        hard_block: false
+        warn_condition: "M{N+1}_per_rubric_lower95 < M{N}_per_rubric_lower95 - 0.02"
+        note: "T1-05 fix — 차원별 lower95가 cycle 간 후퇴(허용 오차 0.02) 시 SYNTH 권고 강제. info(전 v1.0)에서 warn으로 격상. D9 결정 후 hard-block 승격 검토."
+      per_rubric_diagnostic_qwk:
+        operator: "info"
+        applies_to: [exp, org, cont]
+        hard_block: false
+        note: "차원별 QWK 점추정 정보 보고. 단조 후퇴는 per_rubric_monotone_evolution이 처리."
+      # R2-NF7 fix: M5→M6 차원별 ordering warn (overall은 strict baseline_ordering_overall이 처리)
+      m6_per_rubric_evolution:
+        operator: "warn"
+        applies_to: [exp, org, cont]
+        hard_block: false
+        warn_condition: "M6_per_rubric_lower95 < M5_per_rubric_lower95 - 0.02"
+        comparison_scope: "same_cycle"   # R2-G5 fix — 동일 cycle 내 M5(base) vs M6(ensemble) 비교
+        note: "R2-NF7 + R2-G5 fix — M6 multi-output OOF가 동일 cycle 내에서 M5 대비 차원별 후퇴(허용 오차 0.02) 시 SYNTH 권고 강제. per_rubric_monotone_evolution은 cross-cycle M{N+1} vs M{N}이므로 의미 다름. D9 후 hard-block 승격 검토."
+    # R2-G1 fix: segment_metrics를 stage 직계로 unindent (다른 stage와 schema 일관)
+    segment_metrics:
+      required_segments:
+        - type           # 논술형/수필형
+        - grade_band     # 초4-5 / 초6-중1 / 중2-고1 / 고2-고3
+        - score_band     # overall: low_0_9/mid_10_19/high_20_30, per-rubric: low_0_1/mid_1_2/high_2_3
+      min_segment_rows_warn:
+        operator: ">="
+        value: 50
+      min_segment_qwk:
+        operator: ">="
+        value: 0.0
+        hard_block: false
+        note: "mid-scale 5K — segment QWK floor (Phase 2 inheritance)"
+      max_score_band_bias_abs:
+        operator: "<="
+        value: 1.00
+        hard_block: false
+    # T2-10 (R2-F8): overall fairness 단위 명시
+    fairness_gate:
+      ratio: 0.7
+      per_rubric: true
+      applies_to: [exp, org, cont, overall]
+      hard_block: true
+      failure_judgement: FAIL_REVIEW_LABELS
+      unit_per_dimension:
+        exp: native_0_3
+        org: native_0_3
+        cont: native_0_3
+        overall: raw_0_30        # overall_norm 역변환 후 평가
+      band_source: score_band_cutoffs
+      worst_band_definition: "min(mid, high) — low band 제외 (low N<10 시 SKIP_UNSTABLE)"
+      note: "Hard Rule #14 확장 — 각 차원의 worst_band_qwk ≥ macro_qwk × 0.7. T1-04 차원별 cutoff + T2-10 overall raw 단위 명시."
+    hpo:
+      min_trials_cumulative:
+        operator: ">="
+        value: 50
+        hard_block: true
+        applies_to_cycle: M3_plus
+        failure_judgement: FAIL_RETRY_HPO
+        note: "Hard Rule #12 — M3+ 누적 50 hard-block. M2는 per_cycle_min_trials=30만 적용."
+      # T3-11 (R2-F14): per-cycle minimum
+      per_cycle_min_trials:
+        operator: ">="
+        value: 30
+        hard_block: true
+        applies_to_cycle: M2_only   # M2는 단독 30, M3+는 누적 50
+        failure_judgement: FAIL_RETRY_HPO
+      # R2-NF8 fix: M3+에서 cycle 진입 시 최소 trial 추가
+      per_cycle_min_trials_m3_plus:
+        operator: ">="
+        value: 5
+        hard_block: true
+        applies_to_cycle: M3_plus
+        failure_judgement: FAIL_RETRY_HPO
+        note: "R2-NF8 fix — M3+ cycle도 최소 5 trial 추가 의무. 0 trial로 누적 50 통과 차단."
+    fold_constraints:
+      min_valid_n_per_fold:
+        operator: ">="
+        value: 300
+        hard_block: true
+        failure_judgement: FAIL_REBUILD_FEATURES
+        note: "Hard Rule SPLIT — k=5 inheritance"
+    ceiling_comparison:
+      metric_unit: "QWK(model_pred, 3-rater-average)"
+      bootstrap_ci_required: true
+      hard_block: true
+      block_condition: "model_lower95 > ceiling_upper95"
+      failure_judgement: FAIL_REBUILD_FEATURES
+      note: "Mid-scale hard-block (Hard Rule #8) — Phase 3에서 유지"
+    # T2-04 (R2-F6 + R3-F13 + R4-F8): PASS_CANDIDATE stuck escalation
+    auto_continue:
+      enabled: true
+      conditions_all_required:
+        - judgement_in: [PASS_CANDIDATE]
+        - fairness_gate_pass_per_rubric: true
+        - cost_circuit_breaker: false
+        - monotone_evolution_violations: 0
+        - per_rubric_monotone_regressions: 0     # T1-05 추가
+        - evaluator_wire_up_completed: true       # T1-03 추가 — wire-up 안 되면 자동 진행 금지
+      grace_hours: 6
+      consecutive_pass_candidate_max: 2          # T2-04 — 동일 judgement 2회 후 인간 게이트
+      evolution_progress_required:
+        metric: m5_overall_qwk_lower95
+        min_improvement_per_cycle: 0.01           # PASS_CANDIDATE 누적 비용 차단
+        window_cycles: 2
+        # R2-G3 fix: 첫 3 cycle 면제를 grace_cycles 정량 파라미터로 명시
+        grace_cycles: 3                            # M2(wire-up) + M3(초기 학습) + M4(안정화) 본 임계 미적용
+        # R2-NF4 + R2-G3 fix: 0.01 임계 근거 + grace_cycles 일관성
+        threshold_rationale: |
+          M4 LightGBM baseline QWK 0.2635 (Phase 2). M5 목표 0.40+ 도달까지 ≈ 14 cycles 가정.
+          (0.40 - 0.26) / 14 ≈ 0.01/cycle. 0.01 미만 = 학습 정체로 간주 + escalation.
+          grace_cycles=3 명시 (M2 wire-up + M3 초기 학습 + M4 안정화) — 그 후 cycle부터 window_cycles=2 누적 평가.
+          본 정량 파라미터(grace_cycles)가 정성 설명("첫 3 cycle 미적용")과 일관 보장.
+      escalation_on_stuck: FAIL_STOP_NO_GAIN
+      note: "phase_3_operations_guide § 6.2 — 자동 [Continue]. timeout 6h 후 모든 조건 충족 시 자동 진행. PASS_CANDIDATE 2회 연속 동일 metric (±0.01) 시 escalation."
+    pass_judgement: PASS_CANDIDATE
+    final_judgement_allowed: false
+
   full:
     scope:
       dataset: "full dataset after human Phase-up approval"
@@ -288,6 +492,7 @@ mlflow_recording:
     - decision_summary.md
   required_tags:
     - cycle_id
+    - phase
     - kanban_task_id
     - feature_provenance
     - dataset_version
@@ -298,5 +503,5 @@ decision_mapping:
   hard_gate_failure: "Use the gate-specific failure_judgement."
   toy_metric_warning_only: PASS_CANDIDATE
   accepted_non_final_model: PASS_CANDIDATE
-  final_model_registration_requested: PASS_FINAL
+  final_model_registration_requested: "PASS_FINAL only when active stage final_judgement_allowed=true; otherwise PASS_CANDIDATE + human Phase-up gate"
   no_gain_after_allowed_cycles: FAIL_STOP_NO_GAIN
