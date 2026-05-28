@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build leakage-free text features for each split fold.
+"""Build leakage-free text features and Phase 3 target contracts for each split fold.
 
 The builder reads only model-visible essay text: Phase 1 source
 ``essay_txt`` or Phase 2 label-only ``paragraph[].paragraph_txt``. Audit-table
@@ -24,10 +24,58 @@ import yaml
 from scipy import sparse
 from sklearn.feature_extraction.text import TfidfVectorizer
 
+try:
+    from pipelines.extract_5k import validate_rubric_for_phase3
+except ModuleNotFoundError:  # direct `python3 pipelines/build_features.py`
+    from extract_5k import validate_rubric_for_phase3
+
 
 SENTENCE_SEPARATOR = "#@문장구분#"
 DEFAULT_WORD_MAX_FEATURES = 5000
 DEFAULT_CHAR_MAX_FEATURES = 10000
+W_OVERALL_DEFAULT = 0.5
+PHASE3_LABEL_COLUMNS = [
+    "target_exp",
+    "target_org",
+    "target_cont",
+    "target_overall_norm",
+]
+PHASE3_WEIGHT_COLUMNS = [
+    "w_exp",
+    "w_org",
+    "w_cont",
+    "w_overall",
+]
+PHASE3_TARGET_SCHEMA_PATHS = {
+    "target_exp": [
+        "score.essay_scoreT_detail.essay_scoreT_exp",
+        "rubric.expression_weight.exp_grammar",
+        "rubric.expression_weight.exp_vocab",
+        "rubric.expression_weight.exp_style",
+    ],
+    "target_org": [
+        "score.essay_scoreT_detail.essay_scoreT_org",
+        "rubric.organization_weight.org_paragraph",
+        "rubric.organization_weight.org_essay",
+        "rubric.organization_weight.org_coherence",
+        "rubric.organization_weight.org_quantity",
+    ],
+    "target_cont": [
+        "score.essay_scoreT_detail.essay_scoreT_cont",
+        "rubric.content_weight.con_clearance",
+        "rubric.content_weight.con_description",
+        "rubric.content_weight.con_novelty",
+        "rubric.content_weight.con_prompt",
+    ],
+    "target_overall_norm": ["score.essay_scoreT_avg / 10.0"],
+    "target_overall_raw": ["score.essay_scoreT_avg"],
+    "w_exp": ["rubric.expression_weight.exp"],
+    "w_org": ["rubric.organization_weight.org"],
+    "w_cont": ["rubric.content_weight.con"],
+    "w_overall": [
+        f"rubric.overall_weight if present else W_OVERALL_DEFAULT={W_OVERALL_DEFAULT}"
+    ],
+}
 NUMERIC_FEATURES = [
     "essay_char_count",
     "essay_word_token_count",
@@ -57,6 +105,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--word-max-features", type=int, default=DEFAULT_WORD_MAX_FEATURES)
     parser.add_argument("--char-max-features", type=int, default=DEFAULT_CHAR_MAX_FEATURES)
+    parser.add_argument(
+        "--phase3-target-contract",
+        choices=["auto", "required", "off"],
+        default="auto",
+        help=(
+            "Emit Phase 3 labels/macro_weights artifacts for M5. auto emits when "
+            "source JSON rows contain score+rubric, required fails if they do not, "
+            "and off skips legacy target-contract output."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -81,6 +139,19 @@ def write_json(path: Path, payload: Any) -> None:
     with path.open("w", encoding="utf-8") as handle:
         json.dump(payload, handle, ensure_ascii=False, indent=2)
         handle.write("\n")
+
+
+def resolve_source_path(source_dir: Path, relative_path: str) -> Path:
+    candidates = [
+        source_dir / relative_path,
+        source_dir / "라벨링데이터" / relative_path,
+        source_dir / "원천데이터" / relative_path,
+    ]
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    tried = [candidate.as_posix() for candidate in candidates]
+    raise FileNotFoundError(f"missing source JSON for {relative_path}; tried={tried}")
 
 
 def load_audit_index(audit_table: Path) -> dict[str, dict[str, str]]:
@@ -134,12 +205,12 @@ def load_audit_index(audit_table: Path) -> dict[str, dict[str, str]]:
     return index
 
 
-def extract_model_text(doc: dict[str, Any], path: Path) -> tuple[str, str]:
-    """Return (essay_id, model-visible essay text) from supported JSON layouts."""
+def extract_model_text(doc: dict[str, Any], path: Path) -> tuple[str, str, str]:
+    """Return (essay_id, model-visible essay text, source field) from supported layouts."""
     essay_id = doc.get("essay_id")
     raw_text = doc.get("essay_txt")
     if isinstance(essay_id, str) and isinstance(raw_text, str) and raw_text.strip():
-        return essay_id, raw_text
+        return essay_id, raw_text, "essay_txt"
 
     info = doc.get("info") if isinstance(doc.get("info"), dict) else {}
     essay_id = info.get("essay_id")
@@ -151,9 +222,81 @@ def extract_model_text(doc: dict[str, Any], path: Path) -> tuple[str, str]:
     ] if isinstance(paragraph, list) else []
     raw_text = "\n".join(paragraph_texts)
     if isinstance(essay_id, str) and raw_text.strip():
-        return essay_id, raw_text
+        return essay_id, raw_text, "paragraph[].paragraph_txt"
 
     raise ValueError(f"missing model-visible essay text in {path}")
+
+
+def _is_number(value: object) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _weighted_rater_average(scores_per_rater: list[list[float]], weights: list[float]) -> float:
+    denominator = sum(float(weight) for weight in weights)
+    if denominator <= 0:
+        raise ValueError("rubric sub-weight sum must be > 0")
+    per_rater = []
+    for rater_scores in scores_per_rater:
+        per_rater.append(
+            sum(float(score) * float(weight) for score, weight in zip(rater_scores, weights))
+            / denominator
+        )
+    return float(sum(per_rater) / len(per_rater))
+
+
+def compute_rubric_targets(essay_json: dict[str, Any]) -> dict[str, float]:
+    """Strict Phase 3 target and loss-weight builder.
+
+    The implementation mirrors docs § 7.2 and intentionally calls
+    validate_rubric_for_phase3 first so schema drift fails before target arrays
+    are emitted.
+    """
+    ok, reason = validate_rubric_for_phase3(essay_json)
+    if not ok:
+        essay_id = essay_json.get("info", {}).get("essay_id", "UNKNOWN")
+        raise ValueError(
+            "compute_rubric_targets: Phase 3 rubric validation failed for "
+            f"essay_id={essay_id}: {reason}"
+        )
+
+    rubric = essay_json["rubric"]
+    detail = essay_json["score"]["essay_scoreT_detail"]
+    exp_sub_w = [
+        float(rubric["expression_weight"][key])
+        for key in ["exp_grammar", "exp_vocab", "exp_style"]
+    ]
+    org_sub_w = [
+        float(rubric["organization_weight"][key])
+        for key in ["org_paragraph", "org_essay", "org_coherence", "org_quantity"]
+    ]
+    cont_sub_w = [
+        float(rubric["content_weight"][key])
+        for key in ["con_clearance", "con_description", "con_novelty", "con_prompt"]
+    ]
+
+    if "overall_weight" in rubric:
+        if not _is_number(rubric["overall_weight"]):
+            essay_id = essay_json.get("info", {}).get("essay_id", "UNKNOWN")
+            raise ValueError(
+                "compute_rubric_targets: rubric.overall_weight non-numeric for "
+                f"essay_id={essay_id}"
+            )
+        w_overall = float(rubric["overall_weight"])
+    else:
+        w_overall = W_OVERALL_DEFAULT
+
+    overall_raw = float(essay_json["score"]["essay_scoreT_avg"])
+    return {
+        "target_exp": _weighted_rater_average(detail["essay_scoreT_exp"], exp_sub_w),
+        "target_org": _weighted_rater_average(detail["essay_scoreT_org"], org_sub_w),
+        "target_cont": _weighted_rater_average(detail["essay_scoreT_cont"], cont_sub_w),
+        "target_overall_norm": overall_raw / 10.0,
+        "target_overall_raw": overall_raw,
+        "w_exp": float(rubric["expression_weight"]["exp"]),
+        "w_org": float(rubric["organization_weight"]["org"]),
+        "w_cont": float(rubric["content_weight"]["con"]),
+        "w_overall": w_overall,
+    }
 
 
 def normalize_text(raw_text: str) -> str:
@@ -224,9 +367,9 @@ def read_source_row(
     else:
         audit_text_hash = None
 
-    source_path = source_dir / relative_path
+    source_path = resolve_source_path(source_dir, relative_path)
     source = load_json(source_path)
-    essay_id, raw_text = extract_model_text(source, source_path)
+    essay_id, raw_text, text_source_field = extract_model_text(source, source_path)
     if essay_id != item.get("essay_id"):
         raise ValueError(
             f"essay_id mismatch for {relative_path}: split={item.get('essay_id')} source={essay_id}"
@@ -237,13 +380,159 @@ def read_source_row(
             "audit/source hash mismatch for "
             f"{relative_path}: audit={audit_text_hash} source={source_sha256}"
         )
+    phase3_targets = (
+        compute_rubric_targets(source)
+        if "rubric" in source or "score" in source
+        else None
+    )
     return {
         "essay_id": essay_id,
         "relative_path": relative_path,
         "source_sha256": source_sha256,
+        "text_source_field": text_source_field,
         "raw_text": raw_text,
         "normalized_text": normalize_text(raw_text),
         "numeric": numeric_features(raw_text),
+        "phase3_targets": phase3_targets,
+    }
+
+
+def should_emit_phase3_targets(
+    rows: list[dict[str, Any]],
+    phase3_target_contract: str,
+    fold: int,
+) -> bool:
+    if phase3_target_contract == "off":
+        return False
+
+    present = [row.get("phase3_targets") is not None for row in rows]
+    if all(present):
+        return True
+    if any(present):
+        missing = [
+            row["relative_path"]
+            for row, has_targets in zip(rows, present)
+            if not has_targets
+        ][:10]
+        raise ValueError(
+            "mixed Phase 3 target availability in fold "
+            f"{fold}; first missing rows: {missing}"
+        )
+    if phase3_target_contract == "required":
+        raise ValueError(
+            f"Phase 3 target contract required but no score/rubric rows found in fold {fold}"
+        )
+    return False
+
+
+def _array_stats(values: np.ndarray, columns: list[str]) -> dict[str, dict[str, float]]:
+    return {
+        column: {
+            "min": float(values[:, idx].min()),
+            "max": float(values[:, idx].max()),
+            "mean": float(values[:, idx].mean()),
+        }
+        for idx, column in enumerate(columns)
+    }
+
+
+def build_phase3_target_artifacts(
+    fold: int,
+    rows: list[dict[str, Any]],
+    output_dir: Path,
+    train_n: int,
+    valid_n: int,
+) -> dict[str, Any]:
+    labels = np.array(
+        [
+            [row["phase3_targets"][column] for column in PHASE3_LABEL_COLUMNS]
+            for row in rows
+        ],
+        dtype=np.float32,
+    )
+    macro_weights = np.array(
+        [
+            [row["phase3_targets"][column] for column in PHASE3_WEIGHT_COLUMNS]
+            for row in rows
+        ],
+        dtype=np.float32,
+    )
+    target_overall_raw = np.array(
+        [row["phase3_targets"]["target_overall_raw"] for row in rows],
+        dtype=np.float32,
+    )
+    expected_shape = (len(rows), 4)
+    if labels.shape != expected_shape:
+        raise RuntimeError(f"labels shape mismatch for fold {fold}: {labels.shape}")
+    if macro_weights.shape != expected_shape:
+        raise RuntimeError(
+            f"macro_weights shape mismatch for fold {fold}: {macro_weights.shape}"
+        )
+
+    target_npz_path = output_dir / f"fold_{fold}_phase3_targets.npz"
+    np.savez_compressed(
+        target_npz_path,
+        labels=labels,
+        macro_weights=macro_weights,
+        target_overall_raw=target_overall_raw,
+        label_columns=np.array(PHASE3_LABEL_COLUMNS),
+        macro_weight_columns=np.array(PHASE3_WEIGHT_COLUMNS),
+    )
+
+    target_row_manifest = {
+        "fold": fold,
+        "row_order": "train_then_valid",
+        "target_artifact_path": str(target_npz_path),
+        "label_columns": PHASE3_LABEL_COLUMNS,
+        "macro_weight_columns": PHASE3_WEIGHT_COLUMNS,
+        "labels_shape": list(labels.shape),
+        "macro_weights_shape": list(macro_weights.shape),
+        "target_overall_raw_shape": [int(target_overall_raw.shape[0])],
+        "text_contract": {
+            "field": "text",
+            "source": "source_json.essay_txt_or_label_json.paragraph[].paragraph_txt",
+            "stored_in_manifest": False,
+            "hash_field": "source_sha256",
+        },
+        "prompt_text": {
+            "enabled": False,
+            "included": False,
+            "reason": "requires explicit feature flag and provenance approval",
+        },
+        "rows": [
+            {
+                "row_index": idx,
+                "partition": "train" if idx < train_n else "valid",
+                "essay_id": row["essay_id"],
+                "relative_path": row["relative_path"],
+                "text_source_field": row["text_source_field"],
+                "source_sha256": row["source_sha256"],
+            }
+            for idx, row in enumerate(rows)
+        ],
+    }
+    target_row_manifest_path = output_dir / f"fold_{fold}_phase3_transformer_rows.json"
+    write_json(target_row_manifest_path, target_row_manifest)
+
+    return {
+        "fold": fold,
+        "target_artifact_path": str(target_npz_path),
+        "target_artifact_sha256": sha256_file(target_npz_path),
+        "target_row_manifest_path": str(target_row_manifest_path),
+        "target_row_manifest_sha256": sha256_file(target_row_manifest_path),
+        "row_order": "train_then_valid",
+        "train_n": train_n,
+        "valid_n": valid_n,
+        "labels_shape": [int(labels.shape[0]), int(labels.shape[1])],
+        "macro_weights_shape": [
+            int(macro_weights.shape[0]),
+            int(macro_weights.shape[1]),
+        ],
+        "target_overall_raw_shape": [int(target_overall_raw.shape[0])],
+        "label_columns": PHASE3_LABEL_COLUMNS,
+        "macro_weight_columns": PHASE3_WEIGHT_COLUMNS,
+        "label_stats": _array_stats(labels, PHASE3_LABEL_COLUMNS),
+        "macro_weight_stats": _array_stats(macro_weights, PHASE3_WEIGHT_COLUMNS),
     }
 
 
@@ -254,6 +543,7 @@ def build_fold(
     word_max_features: int,
     char_max_features: int,
     audit_index: dict[str, dict[str, str]] | None,
+    phase3_target_contract: str,
 ) -> dict[str, Any]:
     fold_doc = load_json(fold_path)
     fold = int(fold_doc["fold"])
@@ -354,8 +644,17 @@ def build_fold(
     }
     row_manifest_path = output_dir / f"fold_{fold}_row_manifest.json"
     write_json(row_manifest_path, row_manifest)
+    phase3_outputs = None
+    if should_emit_phase3_targets(all_rows, phase3_target_contract, fold):
+        phase3_outputs = build_phase3_target_artifacts(
+            fold=fold,
+            rows=all_rows,
+            output_dir=output_dir,
+            train_n=len(train_rows),
+            valid_n=len(valid_rows),
+        )
 
-    return {
+    output = {
         "fold": fold,
         "matrix_path": str(matrix_path),
         "matrix_sha256": sha256_file(matrix_path),
@@ -373,6 +672,9 @@ def build_fold(
         "char_tfidf_features": int(char_train.shape[1]),
         "derived_numeric_features": len(NUMERIC_FEATURES),
     }
+    if phase3_outputs is not None:
+        output["phase3_transformer_contract"] = phase3_outputs
+    return output
 
 
 def feature_config(
@@ -413,12 +715,21 @@ def feature_config(
             ],
             "label_json_access": "forbidden except Phase 2 label-only text fields",
             "label_only_json_access": (
-                "allowed only for paragraph[].paragraph_txt and info.essay_id "
-                "when source JSONs are not present"
+                "allowed for paragraph[].paragraph_txt and info.essay_id as "
+                "model-visible text identity, and for Phase 3 target/loss-weight "
+                "artifacts when score+rubric are present"
             ),
             "student_location": "forbidden_model_input; split metadata only",
             "student_grade": "allowed_by_policy_but_not_used_in_this_feature_matrix",
-            "target_scores": "forbidden",
+            "target_scores": "forbidden_as_model_input; emitted only as training targets",
+            "prompt_text": "disabled; requires explicit feature flag and provenance approval",
+        },
+        "phase3_target_contract": {
+            "mode": args.phase3_target_contract,
+            "target_columns": PHASE3_LABEL_COLUMNS,
+            "macro_weight_columns": PHASE3_WEIGHT_COLUMNS,
+            "overall_weight_default": W_OVERALL_DEFAULT,
+            "schema_paths": PHASE3_TARGET_SCHEMA_PATHS,
         },
         "text_preprocessing": {
             "sentence_separator": SENTENCE_SEPARATOR,
@@ -458,6 +769,7 @@ def provenance_manifest(
     fold_outputs: list[dict[str, Any]],
     config_hash: str,
     audit_table_hash: str | None,
+    transformer_manifest_hash: str | None,
 ) -> dict[str, Any]:
     features: list[dict[str, Any]] = [
         {
@@ -528,10 +840,27 @@ def provenance_manifest(
             "student_date",
             "student_educated",
             "student_reading",
-            "rubric weights",
+            "rubric weights as model input features",
             "audit table label-side columns",
         ],
         "features": features,
+        "phase3_targets": {
+            "status": "PASS" if all_have_phase3_contract(fold_outputs) else "NOT_EMITTED",
+            "mode": args.phase3_target_contract,
+            "labels_are_training_targets": True,
+            "macro_weights_are_loss_weights": True,
+            "not_model_input_features": True,
+            "target_columns": PHASE3_LABEL_COLUMNS,
+            "macro_weight_columns": PHASE3_WEIGHT_COLUMNS,
+            "schema_paths": PHASE3_TARGET_SCHEMA_PATHS,
+            "transformer_input_manifest_path": (
+                f"{args.output_dir}/phase3_transformer_input_manifest.json"
+                if all_have_phase3_contract(fold_outputs)
+                else None
+            ),
+            "transformer_input_manifest_sha256": transformer_manifest_hash,
+            "prompt_text_enabled": False,
+        },
         "fold_outputs": fold_outputs,
         "verification_command": (
             "python3 -c \"import json; "
@@ -539,6 +868,82 @@ def provenance_manifest(
             "assert m['label_side_feature_count']==0; "
             "assert all(f.get('label_side') is False for f in m['features']); "
             "assert all('source' in f and 'derived' in f for f in m['features'])\""
+        ),
+    }
+
+
+def all_have_phase3_contract(fold_outputs: list[dict[str, Any]]) -> bool:
+    return bool(fold_outputs) and all(
+        "phase3_transformer_contract" in fold for fold in fold_outputs
+    )
+
+
+def phase3_transformer_input_manifest(
+    args: argparse.Namespace,
+    fold_outputs: list[dict[str, Any]],
+    config_hash: str,
+) -> dict[str, Any]:
+    contract_outputs = [fold["phase3_transformer_contract"] for fold in fold_outputs]
+    return {
+        "cycle_id": args.cycle_id,
+        "kanban_task_id": args.kanban_task_id,
+        "created_at_utc": datetime.now(timezone.utc).isoformat(),
+        "status": "PASS",
+        "feature_config_path": f"{args.output_dir}/feature_config.yaml",
+        "feature_config_sha256": config_hash,
+        "contract": {
+            "text": {
+                "name": "text",
+                "source": "source_json.essay_txt_or_label_json.paragraph[].paragraph_txt",
+                "stored_in_manifest": False,
+                "alignment": "row_order=train_then_valid per fold",
+            },
+            "labels": {
+                "array_name": "labels",
+                "order": PHASE3_LABEL_COLUMNS,
+                "shape": "(N, 4)",
+                "dtype": "float32",
+                "schema_paths": {
+                    key: PHASE3_TARGET_SCHEMA_PATHS[key]
+                    for key in PHASE3_LABEL_COLUMNS
+                },
+            },
+            "macro_weights": {
+                "array_name": "macro_weights",
+                "order": PHASE3_WEIGHT_COLUMNS,
+                "shape": "(N, 4)",
+                "dtype": "float32",
+                "loss_formula": "((preds - labels) ** 2 * macro_weights).sum(dim=1).mean()",
+                "schema_paths": {
+                    key: PHASE3_TARGET_SCHEMA_PATHS[key]
+                    for key in PHASE3_WEIGHT_COLUMNS
+                },
+            },
+            "target_overall_raw": {
+                "array_name": "target_overall_raw",
+                "shape": "(N,)",
+                "dtype": "float32",
+                "schema_paths": PHASE3_TARGET_SCHEMA_PATHS["target_overall_raw"],
+                "usage": "evaluation/reference only, not model input",
+            },
+            "prompt_text": {
+                "enabled": False,
+                "included": False,
+                "reason": "requires explicit feature flag and provenance approval",
+            },
+        },
+        "folds": contract_outputs,
+        "verification_command": (
+            "python3 -c \"import json, numpy as np; "
+            f"m=json.load(open('{args.output_dir}/phase3_transformer_input_manifest.json')); "
+            "assert m['status']=='PASS'; "
+            "assert m['contract']['labels']['order']=="
+            f"{PHASE3_LABEL_COLUMNS!r}; "
+            "assert m['contract']['macro_weights']['order']=="
+            f"{PHASE3_WEIGHT_COLUMNS!r}; "
+            "assert m['contract']['prompt_text']['enabled'] is False; "
+            "assert all(((a:=np.load(f['target_artifact_path']))['labels'].shape[1] == 4 "
+            "and a['macro_weights'].shape[1] == 4) for f in m['folds'])\""
         ),
     }
 
@@ -556,6 +961,7 @@ def reproducibility_manifest(
     audit_table_hash: str | None,
     config_hash: str,
     provenance_hash: str,
+    transformer_manifest_hash: str | None,
     fold_outputs: list[dict[str, Any]],
     expected_fold_count: int,
 ) -> dict[str, Any]:
@@ -575,6 +981,12 @@ def reproducibility_manifest(
             f"{args.output_dir}/feature_provenance_manifest.json"
         ),
         "feature_provenance_manifest_sha256": provenance_hash,
+        "phase3_transformer_input_manifest_path": (
+            f"{args.output_dir}/phase3_transformer_input_manifest.json"
+            if transformer_manifest_hash is not None
+            else None
+        ),
+        "phase3_transformer_input_manifest_sha256": transformer_manifest_hash,
         "package_versions": {
             "python": sys.version.split()[0],
             "numpy": np.__version__,
@@ -590,7 +1002,8 @@ def reproducibility_manifest(
             + f"--split-dir {args.split_dir} "
             + f"--output-dir {args.output_dir} "
             + f"--cycle-id {args.cycle_id} --kanban-task-id {args.kanban_task_id} "
-            + f"--seed {args.seed}"
+            + f"--seed {args.seed} "
+            + f"--phase3-target-contract {args.phase3_target_contract}"
         ),
         "verification_commands": [
             (
@@ -603,6 +1016,16 @@ def reproducibility_manifest(
             (
                 "python3 -c \"from scipy import sparse; "
                 f"[sparse.load_npz('{args.output_dir}/X_' + str(i) + '.npz') for i in range({expected_fold_count})]\""
+            ),
+            (
+                "python3 -c \"import json, numpy as np; "
+                f"m=json.load(open('{args.output_dir}/phase3_transformer_input_manifest.json')); "
+                "assert m['status']=='PASS'; "
+                "assert m['contract']['prompt_text']['enabled'] is False; "
+                "assert all(((a:=np.load(f['target_artifact_path']))['labels'].shape[1] == 4 "
+                "and a['macro_weights'].shape[1] == 4) for f in m['folds'])\""
+                if transformer_manifest_hash is not None
+                else "phase3 transformer input manifest not emitted"
             ),
         ],
     }
@@ -618,6 +1041,33 @@ def feature_verification_report(
             **fold
         )
         for fold in fold_outputs
+    )
+    target_lines = "\n".join(
+        "- fold {fold}: labels_shape={labels_shape}, macro_weights_shape={macro_weights_shape}, artifact={target_artifact_path}".format(
+            **fold["phase3_transformer_contract"]
+        )
+        for fold in fold_outputs
+        if "phase3_transformer_contract" in fold
+    )
+    target_section = (
+        f"""
+## Phase 3 Transformer Input Contract
+
+- status: PASS
+- text: model-visible essay text only; raw text is not copied into manifests
+- labels order: `{PHASE3_LABEL_COLUMNS}`
+- macro_weights order: `{PHASE3_WEIGHT_COLUMNS}`
+- prompt_text: disabled
+
+{target_lines}
+"""
+        if target_lines
+        else """
+## Phase 3 Transformer Input Contract
+
+- status: NOT_EMITTED
+- reason: source rows did not contain score+rubric, or target contract mode was off
+"""
     )
     return f"""# Cycle {args.cycle_id} Feature Verification
 
@@ -635,14 +1085,16 @@ Task: `{args.kanban_task_id}`
 Each fold fits word and char TF-IDF vectorizers only on that fold's train rows, then transforms valid rows. Row manifests record `row_order=train_then_valid` and partition per row.
 
 {fold_lines}
+{target_section}
 
 ## Verification Commands
 
 ```bash
 python3 -m py_compile pipelines/build_features.py
-python3 pipelines/build_features.py {audit_arg}--source-dir {args.source_dir} --split-dir {args.split_dir} --output-dir {args.output_dir} --cycle-id {args.cycle_id} --kanban-task-id {args.kanban_task_id} --seed {args.seed}
+python3 pipelines/build_features.py {audit_arg}--source-dir {args.source_dir} --split-dir {args.split_dir} --output-dir {args.output_dir} --cycle-id {args.cycle_id} --kanban-task-id {args.kanban_task_id} --seed {args.seed} --phase3-target-contract {args.phase3_target_contract}
 python3 -c "import json; m=json.load(open('{args.output_dir}/feature_provenance_manifest.json')); assert m['label_side_feature_count']==0; assert all(f.get('label_side') is False for f in m['features']); assert all('source' in f and 'derived' in f for f in m['features'])"
 python3 -c "import json; from pathlib import Path; d=Path('{args.output_dir}'); assert all(json.load(open(d / f'fold_{{i}}_row_manifest.json'))['row_order']=='train_then_valid' for i in range({expected_fold_count}))"
+python3 -c "import json, numpy as np; m=json.load(open('{args.output_dir}/phase3_transformer_input_manifest.json')); assert m['status']=='PASS'; assert m['contract']['labels']['order']=={PHASE3_LABEL_COLUMNS!r}; assert m['contract']['macro_weights']['order']=={PHASE3_WEIGHT_COLUMNS!r}; assert m['contract']['prompt_text']['enabled'] is False; assert all(((a:=np.load(f['target_artifact_path']))['labels'].shape[1] == 4 and a['macro_weights'].shape[1] == 4) for f in m['folds'])"
 ```
 """
 
@@ -704,6 +1156,7 @@ def main() -> int:
                 word_max_features=args.word_max_features,
                 char_max_features=args.char_max_features,
                 audit_index=audit_index,
+                phase3_target_contract=args.phase3_target_contract,
             )
         )
 
@@ -712,10 +1165,25 @@ def main() -> int:
             f"expected {expected_fold_count} fold outputs, got {len(fold_outputs)}"
         )
 
+    transformer_manifest_hash = None
+    if all_have_phase3_contract(fold_outputs):
+        transformer_manifest_path = output_dir / "phase3_transformer_input_manifest.json"
+        write_json(
+            transformer_manifest_path,
+            phase3_transformer_input_manifest(args, fold_outputs, config_hash),
+        )
+        transformer_manifest_hash = sha256_file(transformer_manifest_path)
+
     manifest_path = output_dir / "feature_provenance_manifest.json"
     write_json(
         manifest_path,
-        provenance_manifest(args, fold_outputs, config_hash, audit_table_hash),
+        provenance_manifest(
+            args,
+            fold_outputs,
+            config_hash,
+            audit_table_hash,
+            transformer_manifest_hash,
+        ),
     )
     provenance_hash = sha256_file(manifest_path)
 
@@ -728,6 +1196,7 @@ def main() -> int:
             audit_table_hash=audit_table_hash,
             config_hash=config_hash,
             provenance_hash=provenance_hash,
+            transformer_manifest_hash=transformer_manifest_hash,
             fold_outputs=fold_outputs,
             expected_fold_count=expected_fold_count,
         ),
@@ -740,6 +1209,8 @@ def main() -> int:
 
     print(f"wrote {config_path}")
     print(f"wrote {manifest_path}")
+    if transformer_manifest_hash is not None:
+        print(f"wrote {output_dir / 'phase3_transformer_input_manifest.json'}")
     print(f"wrote {reproducibility_path}")
     print(f"wrote {verification_report_path}")
     for fold in fold_outputs:

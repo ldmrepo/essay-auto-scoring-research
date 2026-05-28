@@ -1,5 +1,21 @@
 # Essay Auto-Scoring Research
 
+<p>
+  <img alt="Python 3.10+" src="https://img.shields.io/badge/Python-3.10%2B-3776AB?style=flat-square&logo=python&logoColor=white">
+  <img alt="pandas" src="https://img.shields.io/badge/pandas-150458?style=flat-square&logo=pandas&logoColor=white">
+  <img alt="scikit-learn" src="https://img.shields.io/badge/scikit--learn-F7931E?style=flat-square&logo=scikitlearn&logoColor=white">
+  <img alt="LightGBM" src="https://img.shields.io/badge/LightGBM-02569B?style=flat-square">
+  <img alt="Hugging Face Transformers" src="https://img.shields.io/badge/Hugging%20Face-Transformers-FFD21E?style=flat-square&logo=huggingface&logoColor=black">
+  <img alt="KLUE-RoBERTa" src="https://img.shields.io/badge/KLUE--RoBERTa-model-4B5563?style=flat-square">
+  <img alt="Optuna" src="https://img.shields.io/badge/Optuna-HPO-3B82F6?style=flat-square">
+  <img alt="MLflow" src="https://img.shields.io/badge/MLflow-tracking-0194E2?style=flat-square&logo=mlflow&logoColor=white">
+  <img alt="SQLite" src="https://img.shields.io/badge/SQLite-003B57?style=flat-square&logo=sqlite&logoColor=white">
+  <img alt="Hermes Kanban" src="https://img.shields.io/badge/Hermes-Kanban-111827?style=flat-square">
+  <img alt="Vast.ai" src="https://img.shields.io/badge/Vast.ai-GPU-16A34A?style=flat-square">
+</p>
+
+![alt text](assets/cover.png)
+
 한국어 K-12 서술형 에세이 자동채점 연구를 Hermes Multi-Agent Kanban Board로 장기 자율 실행하는 검증 프로젝트입니다.
 
 현재 기준은 **Phase 3 Mid Multi-task**입니다. Phase 1 toy 검증과 Phase 2 scalar 모델 검증은 종료됐고, 지금은 5,003건 표본에서 3개 rubric head + overall head를 함께 학습하는 multi-task KLUE-RoBERTa/HPO/ensemble workflow를 검증합니다.
@@ -69,8 +85,26 @@ python3 -m pipelines.extract_5k dataset/1.Training \
 # 데이터 audit
 python3 pipelines/audit_data.py --input dataset/sample_5k/
 
-# split 생성: 기본 k=5, M2 승인 fallback은 region merge + k=3
-python3 pipelines/make_splits.py --input dataset/sample_5k/ --k 5 --output dataset/splits/M<N>/
+# split 생성: 기본 k=5
+python3 pipelines/make_splits.py \
+  --input dataset/sample_5k/ \
+  --k 5 \
+  --output workspace/cycle_M<N>/splits \
+  --cycle-id M<N> \
+  --kanban-task-id <task_id> \
+  --min-valid-n 300 \
+  --group-key student.location
+
+# M2 승인 fallback: 기본 k=5 valid_n 실패 evidence 보존 후 region merge + k=3
+python3 pipelines/make_splits.py \
+  --input dataset/sample_5k/ \
+  --k 3 \
+  --output workspace/cycle_M<N>/splits \
+  --cycle-id M<N> \
+  --kanban-task-id <task_id> \
+  --min-valid-n 300 \
+  --group-key region \
+  --audit-table workspace/cycle_M<N>/audit/data_audit/audit_table_no_raw_text.csv
 
 # CPU baseline
 python3 -m pipelines.train \
@@ -83,10 +117,18 @@ python3 -m pipelines.train \
 
 # HPO
 python3 -m pipelines.run_hpo \
-  --models M4,M5 \
+  --model M4 \
   --cycle-id M<N> \
   --n-trials 30 \
-  --mlflow-uri sqlite:///mlflow.db
+  --study-name cycle_M<N>_M4 \
+  --storage sqlite:///optuna.db \
+  --mlflow-uri sqlite:///mlflow.db \
+  --experiment-name essay-auto-scoring-phase3 \
+  --kanban-task-id <task_id> \
+  --split-dir workspace/cycle_M<N>/splits \
+  --feature-dir workspace/cycle_M<N>/features \
+  --label-dir dataset/sample_5k/ \
+  --output-dir workspace/cycle_M<N>/hpo
 
 # 평가
 python3 pipelines/evaluate.py --cycle-id M<N>
@@ -116,7 +158,7 @@ vastai --api-key "$VAST_API_KEY" search offers 'gpu_ram>=8 reliability>0.95' --r
 │   ├── README.md
 │   ├── archive/
 │   └── research/
-├── reports/
+├── reports/          # optional generated reports, ignored when absent
 ├── skills/
 ├── workspace/        # ignored runtime artifacts
 ├── mlflow.db         # ignored runtime DB

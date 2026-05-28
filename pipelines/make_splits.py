@@ -533,17 +533,34 @@ def manifest(
     if args.audit_table:
         fallback_verification_parts.append(f"--audit-table {args.audit_table}")
 
-    fallback_decision = {
-        "status": "not_applied",
-        "reason": (
-            "Default k=5 student.location split failed the valid_n safety gate. "
-            "Fallback requires explicit policy/acceptance update before use."
-            if hard_blocks
-            else "Default k=5 student.location split passed; fallback not needed."
-        ),
-        "recommended_fallback": "region merge + k=3",
-        "recommended_verification_command": " ".join(fallback_verification_parts),
-    }
+    if args.group_key == "region":
+        fallback_decision = {
+            "status": "applied",
+            "reason": (
+                "Approved region merge + k=3 fallback split generated after "
+                "preserving or reproducing default k=5 student.location failure evidence."
+            ),
+            "recommended_fallback": "region merge + k=3",
+            "recommended_verification_command": " ".join(fallback_verification_parts),
+        }
+    elif hard_blocks:
+        fallback_decision = {
+            "status": "authorized_after_documented_failure",
+            "reason": (
+                "Default k=5 student.location split failed the valid_n safety gate. "
+                "Active policy authorizes region merge + k=3 fallback after this "
+                "failure evidence is preserved."
+            ),
+            "recommended_fallback": "region merge + k=3",
+            "recommended_verification_command": " ".join(fallback_verification_parts),
+        }
+    else:
+        fallback_decision = {
+            "status": "not_applied",
+            "reason": "Default k=5 student.location split passed; fallback not needed.",
+            "recommended_fallback": "region merge + k=3",
+            "recommended_verification_command": " ".join(fallback_verification_parts),
+        }
 
     return {
         "cycle_id": args.cycle_id,
@@ -700,7 +717,7 @@ Acceptance check, absolute fold deviation from overall distribution:
 
 ## Hard Blocks
 {hard_block_lines}
-- Rationale: this Phase 2 split requires every fold to satisfy `valid_n >= {manifest_doc['min_valid_n']}`.
+- Rationale: this split policy requires every fold to satisfy `valid_n >= {manifest_doc['min_valid_n']}`.
 
 ## Fallback Decision
 - Status: `{manifest_doc['fallback_decision']['status']}`
